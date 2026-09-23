@@ -6,7 +6,7 @@
 (function () {
     'use strict';
 
-    var DEFAULT_TIF = 'ETc_NDVI.tif';
+    var DEFAULT_TIF = 'https://satalite-images-04-2026.s3.eu-north-1.amazonaws.com/Individual/amhashem85-gmail.com/Dina_Farms/Takwa_1_correct/851e9092-44e4-49c8-9e89-d6974b9bf03c/processed/2026-06-26_084002/NDVI.tif';
     var ACRES_PER_M2 = 0.000247105;
     var CLASS_NAMES = [null, 'Low', 'Medium', 'High'];
     var CLASS_COLORS = [
@@ -882,7 +882,14 @@
             if (!res.ok) throw new Error('not found');
             return res.arrayBuffer();
         }).then(function (buf) {
-            return loadBuffer(buf, DEFAULT_TIF);
+            return loadBuffer(buf, 'NDVI.tif');
+        }).catch(function () {
+            return fetch('NDVI.tif').then(function (res) {
+                if (!res.ok) throw new Error('not found');
+                return res.arrayBuffer();
+            }).then(function (buf) {
+                return loadBuffer(buf, 'NDVI.tif');
+            });
         }).catch(function () {
             setMessage('Open a GeoTIFF to begin');
         });
