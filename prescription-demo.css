@@ -248,6 +248,32 @@ body {
     color: #fff;
 }
 
+.panel-field.panel-field-stack {
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    text-align: left;
+}
+
+.panel-field-stack .picker-btn,
+.panel-field-stack .picker-menu {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.panel-field-stack .picker-menu {
+    left: 0;
+    right: auto;
+}
+
+.chart-agg {
+    display: block;
+    margin-top: 1px;
+    font-size: 11px;
+    font-weight: 500;
+    color: #6b7280;
+}
+
 .panel-field {
     display: flex;
     align-items: center;

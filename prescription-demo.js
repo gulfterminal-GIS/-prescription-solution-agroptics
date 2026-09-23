@@ -6,7 +6,7 @@
 (function () {
     'use strict';
 
-    var DEFAULT_TIF = 'https://satalite-images-04-2026.s3.eu-north-1.amazonaws.com/Individual/omar-gulfterminal.com/happy_farm/test/7945ae9b-6431-43ef-9de8-383f56dd22f4/processed/planet/2026-09-06_174801/NDVI.tif';
+    var DEFAULT_TIF = 'https://satalite-images-04-2026.s3.eu-north-1.amazonaws.com/Individual/amhashem85-gmail.com/Dina_Farms/Takwa_1_correct/851e9092-44e4-49c8-9e89-d6974b9bf03c/processed/2026-06-26_084002/NDVI.tif';
     var ACRES_PER_M2 = 0.000247105;
     var CLASS_NAMES = [null, 'Low', 'Medium', 'High'];
     var CLASS_COLORS = [
@@ -178,6 +178,34 @@
         var breaks = [];
         for (var i = 1; i < n; i++) breaks.push(i / n);
         return breaks;
+    }
+
+    function equalIntervalBreaks(min, max, n) {
+        var step = (max - min) / n || 0;
+        var breaks = [];
+        for (var i = 1; i < n; i++) breaks.push(min + step * i);
+        return breaks;
+    }
+
+    function chooseBreaks(method, n) {
+        if (method === 'quantile') return quantileBreaks(state.stats.values, n);
+        if (method === 'equal') return equalIntervalBreaks(state.stats.min, state.stats.max, n);
+        if (method === 'table') return tableBreaks(n);
+        var breaks = jenksBreaks(state.stats.values, n);
+        if (!breaks.length) return quantileBreaks(state.stats.values, n);
+        return breaks;
+    }
+
+    function classBounds(method) {
+        if (method === 'table') return { min: 0, max: 1 };
+        return { min: state.stats.min, max: state.stats.max };
+    }
+
+    function methodLabel(method) {
+        if (method === 'quantile') return 'Quantile';
+        if (method === 'equal') return 'Equal interval';
+        if (method === 'table') return 'Reclassify by table';
+        return 'Natural Breaks';
     }
 
     function zoneStyle(z, n) {
@@ -500,14 +528,38 @@
         return polygons;
     }
 
-    function classRange(z, breaks) {
+    function classRange(z, breaks, bounds) {
         var n = breaks.length + 1;
-        if (z <= 1) return { min: 0, max: breaks[0] };
-        if (z >= n) return { min: breaks[breaks.length - 1], max: 1 };
+        if (z <= 1) return { min: bounds.min, max: breaks[0] };
+        if (z >= n) return { min: breaks[breaks.length - 1], max: bounds.max };
         return { min: breaks[z - 2], max: breaks[z - 1] };
     }
 
-    function polygonizeZones(grid, breaks) {
+    function zoneAggregate(grid, agg) {
+        var buckets = {};
+        for (var i = 0; i < grid.length; i++) {
+            var cls = grid[i];
+            if (!cls) continue;
+            if (!buckets[cls]) buckets[cls] = [];
+            buckets[cls].push(state.ndvi[i]);
+        }
+        var out = {};
+        Object.keys(buckets).forEach(function (key) {
+            var vals = buckets[key];
+            if (agg === 'median') {
+                vals.sort(function (a, b) { return a - b; });
+                var mid = (vals.length - 1) / 2;
+                out[key] = (vals[Math.floor(mid)] + vals[Math.ceil(mid)]) / 2;
+            } else {
+                var sum = 0;
+                for (var j = 0; j < vals.length; j++) sum += vals[j];
+                out[key] = sum / vals.length;
+            }
+        });
+        return out;
+    }
+
+    function polygonizeZones(grid, breaks, method, aggValues) {
         var features = [];
         var n = breaks.length + 1;
         for (var z = 1; z <= n; z++) {
@@ -517,9 +569,10 @@
                 return ring.map(function (p) { return pixelCornerToLngLat(p[0], p[1]); });
             });
             var polys = ringsToPolygons(llRings);
-            var range = classRange(z, breaks);
+            var range = classRange(z, breaks, classBounds(method));
             var color = zoneStyle(z, n);
             var name = zoneName(z, n);
+            var agg = aggValues[z];
             polys.forEach(function (coords) {
                 var geom = { type: 'Polygon', coordinates: coords };
                 var areaM2 = 0;
@@ -531,6 +584,7 @@
                         label: name,
                         ndvi_min: Number(range.min.toFixed(4)),
                         ndvi_max: Number(range.max.toFixed(4)),
+                        ndvi_value: agg == null ? null : Number(agg.toFixed(4)),
                         area_acres: Number((areaM2 * ACRES_PER_M2).toFixed(4)),
                         color: color.hex
                     },
@@ -597,7 +651,8 @@
                     zone: z,
                     label: f.properties.label,
                     color: f.properties.color,
-                    acres: 0
+                    acres: 0,
+                    value: f.properties.ndvi_value
                 };
             }
             groups[z].acres += Number(f.properties.area_acres) || 0;
@@ -662,7 +717,9 @@
             var row = document.createElement('div');
             row.className = 'chart-row';
             row.innerHTML = '<span class="chart-dot" style="background:' + slice.color + '"></span>' +
-                '<span>' + slice.zone + ' ' + slice.label + '</span>' +
+                '<span>' + slice.zone + ' ' + slice.label +
+                    (slice.value == null ? '' : '<span class="chart-agg">' + ($('zoneAgg').value === 'median' ? 'Median' : 'Average') + ' ' + fmt(slice.value) + '</span>') +
+                '</span>' +
                 '<span class="chart-acres">' + fmtAcres(slice.acres) + ' ac</span>';
             list.appendChild(row);
         });
@@ -685,7 +742,7 @@
         for (var z = 1; z <= n; z++) {
             var color = zoneStyle(z, n);
             var name = zoneName(z, n);
-            var range = classRange(z, breaks);
+            var range = classRange(z, breaks, classBounds($('zoneMethod').value));
             var seg = document.createElement('div');
             seg.className = 'legend-seg';
             seg.style.background = color.hex;
@@ -699,10 +756,12 @@
                 '<span class="legend-range">' + fmt(range.min) + ' to ' + fmt(range.max) + '</span>';
             rows.appendChild(row);
         }
-        var marks = [0].concat(breaks).concat([1]);
+        var bounds = classBounds($('zoneMethod').value);
+        var marks = [bounds.min].concat(breaks).concat([bounds.max]);
         ticks.innerHTML = marks.map(function (v) {
             return '<span>' + fmt(v) + '</span>';
         }).join('');
+        $('legendTitle').textContent = methodLabel($('zoneMethod').value);
     }
 
     async function generateZones() {
@@ -711,14 +770,18 @@
         await new Promise(function (r) { setTimeout(r, 20); });
         try {
             var n = zoneCount();
-            var breaks = tableBreaks(n);
+            var method = $('zoneMethod').value || 'natural';
+            var breaks = chooseBreaks(method, n);
+            if (!breaks.length) throw new Error('Could not split the index into zones.');
+            var classCount = breaks.length + 1;
             var grid = classifyRaster(breaks);
             var minAcres = Number($('minAcres').value);
             if (!isFinite(minAcres) || minAcres < 0) minAcres = 0;
             sieveSmallComponents(grid, minAcres);
-            var features = polygonizeZones(grid, breaks);
+            var aggValues = zoneAggregate(grid, $('zoneAgg').value);
+            var features = polygonizeZones(grid, breaks, method, aggValues);
             if (!features.length) throw new Error('No polygons. Lower the minimum polygon size.');
-            showClassOverlay(grid, n);
+            showClassOverlay(grid, classCount);
             renderZones(features);
             updateLegend(breaks);
             setMessage('');
@@ -741,6 +804,7 @@
                         label: f.properties.label,
                         ndvi_min: f.properties.ndvi_min,
                         ndvi_max: f.properties.ndvi_max,
+                        ndvi_value: f.properties.ndvi_value,
                         area_acres: f.properties.area_acres
                     },
                     geometry: f.geometry
@@ -844,6 +908,8 @@
 
     function bindUi() {
         enhanceSelect($('zoneCount'));
+        enhanceSelect($('zoneMethod'));
+        enhanceSelect($('zoneAgg'));
         enhanceSelect($('minAcres'));
         document.addEventListener('click', closePickers);
         $('tifInput').addEventListener('change', function (e) {
@@ -853,6 +919,8 @@
         });
         $('minAcres').addEventListener('change', scheduleZones);
         $('zoneCount').addEventListener('change', scheduleZones);
+        $('zoneMethod').addEventListener('change', scheduleZones);
+        $('zoneAgg').addEventListener('change', scheduleZones);
         $('layerImage').addEventListener('change', applyLayers);
         $('layerPolygons').addEventListener('change', applyLayers);
         $('exportGeojsonBtn').addEventListener('click', exportGeoJSON);
@@ -861,6 +929,8 @@
 
     function updateFieldNotes() {
         $('zoneNote').textContent = optionHint($('zoneCount'));
+        $('methodNote').textContent = optionHint($('zoneMethod'));
+        $('aggNote').textContent = optionHint($('zoneAgg'));
         $('acreNote').textContent = optionHint($('minAcres'));
     }
 
