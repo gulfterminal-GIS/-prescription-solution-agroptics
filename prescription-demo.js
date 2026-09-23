@@ -6,7 +6,7 @@
 (function () {
     'use strict';
 
-    var DEFAULT_TIF = 'https://satalite-images-04-2026.s3.eu-north-1.amazonaws.com/Individual/amhashem85-gmail.com/Dina_Farms/Takwa_1_correct/851e9092-44e4-49c8-9e89-d6974b9bf03c/processed/2026-06-26_084002/NDVI.tif';
+    var DEFAULT_TIF = 'https://satalite-images-04-2026.s3.eu-north-1.amazonaws.com/Individual/omar-gulfterminal.com/happy_farm/test/7945ae9b-6431-43ef-9de8-383f56dd22f4/processed/planet/2026-09-06_174801/NDVI.tif';
     var ACRES_PER_M2 = 0.000247105;
     var CLASS_NAMES = [null, 'Low', 'Medium', 'High'];
     var CLASS_COLORS = [
