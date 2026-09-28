@@ -945,45 +945,379 @@
         downloadBlob(blob, state.rxType + '_prescription.geojson');
     }
 
-    /* ═══════════ EXPORT — Shapefile ═════════════════════════════ */
-    function exportShapefile() {
-        /* Minimal shapefile writer — .shp + .shx + .dbf + .prj in a zip-like download */
-        /* Since we don't have a shapefile library in the demo, we export as GeoJSON with
-           a .zip extension note. For full shapefile, the backend will handle it. */
-        /* We create a simple combined download of GeoJSON with shapefile-ready attributes */
-        var fc = {
+    /* ═══════════ EXPORT — Shapefile (.zip) ═════════════════════ */
+
+    /* ── Low-level binary helpers ──────────────────────────────── */
+    function writeInt32BE(view, offset, val) {
+        view.setInt32(offset, val, false); /* big-endian */
+    }
+    function writeInt32LE(view, offset, val) {
+        view.setInt32(offset, val, true); /* little-endian */
+    }
+    function writeFloat64LE(view, offset, val) {
+        view.setFloat64(offset, val, true);
+    }
+
+    /* Build .prj (WGS 84 geographic) */
+    function buildPrj() {
+        return 'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]';
+    }
+
+    /* Build .dbf — dBASE III+ */
+    function buildDbf(records, fieldDefs) {
+        /* fieldDefs: [{name, type:'N'|'C', length, decimals}] */
+        var nRecs = records.length;
+        var nFields = fieldDefs.length;
+        var recLen = 1; /* deletion flag */
+        fieldDefs.forEach(function (f) { recLen += f.length; });
+        var headerSize = 32 + nFields * 32 + 1;
+        var totalSize = headerSize + nRecs * recLen;
+        var buf = new ArrayBuffer(totalSize);
+        var view = new DataView(buf);
+        var u8 = new Uint8Array(buf);
+        /* Version */
+        u8[0] = 3;
+        /* Date */
+        var d = new Date();
+        u8[1] = d.getFullYear() - 1900; u8[2] = d.getMonth() + 1; u8[3] = d.getDate();
+        /* Num records */
+        view.setUint32(4, nRecs, true);
+        /* Header size */
+        view.setUint16(8, headerSize, true);
+        /* Record size */
+        view.setUint16(10, recLen, true);
+        /* Field descriptors at offset 32 */
+        var enc = new TextEncoder();
+        fieldDefs.forEach(function (fd, fi) {
+            var base = 32 + fi * 32;
+            var nameBytes = enc.encode(fd.name.substring(0, 10));
+            for (var i = 0; i < nameBytes.length; i++) u8[base + i] = nameBytes[i];
+            u8[base + 11] = fd.type.charCodeAt(0);
+            u8[base + 16] = fd.length;
+            u8[base + 17] = fd.decimals || 0;
+        });
+        /* Header terminator */
+        u8[32 + nFields * 32] = 0x0D;
+        /* Records */
+        records.forEach(function (rec, ri) {
+            var rBase = headerSize + ri * recLen;
+            u8[rBase] = 0x20; /* not deleted */
+            var fOffset = rBase + 1;
+            fieldDefs.forEach(function (fd) {
+                var raw = String(rec[fd.name] == null ? '' : rec[fd.name]);
+                var padded = raw.substring(0, fd.length).padStart(fd.length, ' ');
+                var bytes = enc.encode(padded).subarray(0, fd.length);
+                for (var i = 0; i < fd.length; i++) u8[fOffset + i] = (bytes[i] || 0x20);
+                fOffset += fd.length;
+            });
+        });
+        return buf;
+    }
+
+    /* Build .shp + .shx for polygon features (ESRI Shapefile type 5) */
+    function buildShpShx(features) {
+        /* Pre-compute record byte sizes */
+        var recordInfos = features.map(function (feat) {
+            var coords = feat.geometry.coordinates;
+            /* Flatten all rings to count total points */
+            var numParts = coords.length;
+            var numPoints = coords.reduce(function (s, ring) { return s + ring.length; }, 0);
+            var contentLen = (44 + numParts * 4 + numPoints * 16) / 2; /* in 16-bit words */
+            return { numParts: numParts, numPoints: numPoints, contentLen: contentLen, coords: coords };
+        });
+
+        /* Global bounding box */
+        var gXmin = Infinity, gYmin = Infinity, gXmax = -Infinity, gYmax = -Infinity;
+        features.forEach(function (f) {
+            f.geometry.coordinates.forEach(function (ring) {
+                ring.forEach(function (pt) {
+                    if (pt[0] < gXmin) gXmin = pt[0]; if (pt[0] > gXmax) gXmax = pt[0];
+                    if (pt[1] < gYmin) gYmin = pt[1]; if (pt[1] > gYmax) gYmax = pt[1];
+                });
+            });
+        });
+        if (!isFinite(gXmin)) { gXmin = gYmin = gXmax = gYmax = 0; }
+
+        /* .shx is fixed at 100 + 8*numRecords bytes */
+        var shxSize = 100 + 8 * features.length;
+        /* .shp size: 100 header + sum of (8 + contentLen*2) per record */
+        var shpSize = 100;
+        recordInfos.forEach(function (r) { shpSize += 8 + r.contentLen * 2; });
+
+        var shpBuf = new ArrayBuffer(shpSize);
+        var shxBuf = new ArrayBuffer(shxSize);
+        var shpV = new DataView(shpBuf);
+        var shxV = new DataView(shxBuf);
+
+        /* Write file header helper */
+        function writeFileHeader(view, fileCode, fileLen) {
+            writeInt32BE(view, 0, 9994);       /* file code */
+            writeInt32BE(view, 24, fileLen);   /* file length in 16-bit words */
+            writeInt32LE(view, 28, 1000);      /* version */
+            writeInt32LE(view, 32, 5);         /* shape type: polygon */
+            writeFloat64LE(view, 36, gXmin);   writeFloat64LE(view, 44, gYmin);
+            writeFloat64LE(view, 52, gXmax);   writeFloat64LE(view, 60, gYmax);
+            /* Z and M bounding box zeros */
+            for (var i = 68; i < 100; i += 8) writeFloat64LE(view, i, 0);
+        }
+        writeFileHeader(shpV, 9994, shpSize / 2);
+        writeFileHeader(shxV, 9994, shxSize / 2);
+
+        var shpOff = 100, shxOff = 100;
+
+        recordInfos.forEach(function (ri, idx) {
+            var coords = ri.coords;
+            var feat = features[idx];
+
+            /* Local bbox */
+            var xmin = Infinity, ymin = Infinity, xmax = -Infinity, ymax = -Infinity;
+            coords.forEach(function (ring) {
+                ring.forEach(function (pt) {
+                    if (pt[0] < xmin) xmin = pt[0]; if (pt[0] > xmax) xmax = pt[0];
+                    if (pt[1] < ymin) ymin = pt[1]; if (pt[1] > ymax) ymax = pt[1];
+                });
+            });
+
+            /* SHX entry */
+            writeInt32BE(shxV, shxOff, shpOff / 2);
+            writeInt32BE(shxV, shxOff + 4, ri.contentLen);
+            shxOff += 8;
+
+            /* SHP record header */
+            writeInt32BE(shpV, shpOff, idx + 1);          /* record number (1-based) */
+            writeInt32BE(shpV, shpOff + 4, ri.contentLen); /* content length */
+            shpOff += 8;
+
+            /* SHP record content */
+            writeInt32LE(shpV, shpOff, 5);                /* shape type polygon */
+            writeFloat64LE(shpV, shpOff + 4, xmin);
+            writeFloat64LE(shpV, shpOff + 12, ymin);
+            writeFloat64LE(shpV, shpOff + 20, xmax);
+            writeFloat64LE(shpV, shpOff + 28, ymax);
+            writeInt32LE(shpV, shpOff + 36, ri.numParts);
+            writeInt32LE(shpV, shpOff + 40, ri.numPoints);
+            var partOff = shpOff + 44;
+            var ptOff = partOff + ri.numParts * 4;
+            var pointIdx = 0;
+            coords.forEach(function (ring, rIdx) {
+                writeInt32LE(shpV, partOff + rIdx * 4, pointIdx);
+                ring.forEach(function (pt) {
+                    writeFloat64LE(shpV, ptOff + pointIdx * 16, pt[0]);
+                    writeFloat64LE(shpV, ptOff + pointIdx * 16 + 8, pt[1]);
+                    pointIdx++;
+                });
+            });
+            shpOff += ri.contentLen * 2;   /* header (8) already consumed above */
+        });
+
+        return { shp: shpBuf, shx: shxBuf };
+    }
+
+    /* Main shapefile export */
+    async function exportShapefile() {
+        if (!state.features.length) return;
+
+        /* Build DBF field definitions (max 10-char names) */
+        var fieldDefs = [
+            { name: 'FID',     type: 'N', length: 6,  decimals: 0 },
+            { name: 'Zone',    type: 'N', length: 4,  decimals: 0 },
+            { name: 'Label',   type: 'C', length: 20, decimals: 0 },
+            { name: 'Rate',    type: 'N', length: 12, decimals: 4 },
+            { name: 'Unit',    type: 'C', length: 16, decimals: 0 },
+            { name: 'Area_ac', type: 'N', length: 12, decimals: 4 },
+            { name: 'Area_ha', type: 'N', length: 12, decimals: 4 },
+            { name: 'Idx_min', type: 'N', length: 12, decimals: 4 },
+            { name: 'Idx_max', type: 'N', length: 12, decimals: 4 },
+            { name: 'Rx_type', type: 'C', length: 20, decimals: 0 }
+        ];
+
+        /* Merge multi-polygon features by zone for cleaner shapefile */
+        var groups = {};
+        state.features.forEach(function (f) {
+            var z = f.properties.zone;
+            if (!groups[z]) {
+                groups[z] = { props: f.properties, polys: [] };
+            }
+            groups[z].polys.push(f);
+        });
+
+        /* Flatten — one record per polygon feature */
+        var outFeatures = [];
+        var dbfRecords = [];
+        var fid = 1;
+        Object.keys(groups).sort(function (a, b) { return Number(a) - Number(b); }).forEach(function (z) {
+            var g = groups[z];
+            g.polys.forEach(function (f) {
+                outFeatures.push(f);
+                dbfRecords.push({
+                    FID:     fid++,
+                    Zone:    f.properties.zone,
+                    Label:   f.properties.label,
+                    Rate:    state.zoneRates[f.properties.zone] || 0,
+                    Unit:    state.rxUnit,
+                    Area_ac: f.properties.area_acres,
+                    Area_ha: f.properties.area_ha,
+                    Idx_min: f.properties.ndvi_min,
+                    Idx_max: f.properties.ndvi_max,
+                    Rx_type: state.rxType
+                });
+            });
+        });
+
+        var shpShx = buildShpShx(outFeatures);
+        var dbfBuf = buildDbf(dbfRecords, fieldDefs);
+        var prjStr = buildPrj();
+
+        var zip = new JSZip();
+        var baseName = state.rxType + '_VRA';
+        zip.file(baseName + '.shp', shpShx.shp);
+        zip.file(baseName + '.shx', shpShx.shx);
+        zip.file(baseName + '.dbf', dbfBuf);
+        zip.file(baseName + '.prj', prjStr);
+        /* Also bundle a GeoJSON for convenience */
+        var geojsonStr = JSON.stringify({
             type: 'FeatureCollection',
-            name: state.rxType + '_VRA',
-            features: state.features.map(function (f, i) {
-                return {
-                    type: 'Feature',
-                    properties: {
-                        FID: i + 1,
-                        Zone: f.properties.zone,
-                        Label: f.properties.label,
-                        Rate: state.zoneRates[f.properties.zone] || 0,
-                        Unit: state.rxUnit,
-                        Area_ac: f.properties.area_acres,
-                        Area_ha: f.properties.area_ha,
-                        Idx_min: f.properties.ndvi_min,
-                        Idx_max: f.properties.ndvi_max,
-                        Rx_type: state.rxType
-                    },
-                    geometry: f.geometry
-                };
+            features: outFeatures.map(function (f, i) {
+                return { type: 'Feature', properties: dbfRecords[i], geometry: f.geometry };
             })
-        };
-        var blob = new Blob([JSON.stringify(fc, null, 2)], { type: 'application/geo+json' });
-        downloadBlob(blob, state.rxType + '_VRA_shapefile_ready.geojson');
-        alert('Shapefile export: In the full Agroptics system, this will generate .shp/.shx/.dbf/.prj files. Currently exported as GeoJSON with shapefile-compatible attributes.');
+        }, null, 2);
+        zip.file(baseName + '.geojson', geojsonStr);
+
+        var zipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+        downloadBlob(zipBlob, baseName + '.zip');
     }
 
     /* ═══════════ EXPORT — PDF Report ════════════════════════════ */
+
+    /* Build classified raster canvas data-URL */
+    function buildClassifiedDataURL() {
+        if (!state.classifiedGrid || !state.ndvi) return null;
+        var n = state.currentBreaks ? state.currentBreaks.length + 1 : 3;
+        var canvas = document.createElement('canvas');
+        canvas.width = state.width;
+        canvas.height = state.height;
+        var ctx = canvas.getContext('2d');
+        var img = ctx.createImageData(state.width, state.height);
+        var colors = [];
+        for (var z = 1; z <= n; z++) colors[z] = zoneStyle(z, n);
+        for (var i = 0; i < state.classifiedGrid.length; i++) {
+            var o = i * 4;
+            var cls = state.classifiedGrid[i];
+            if (!cls || !colors[cls]) { img.data[o + 3] = 0; continue; }
+            img.data[o] = colors[cls].r;
+            img.data[o + 1] = colors[cls].g;
+            img.data[o + 2] = colors[cls].b;
+            img.data[o + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+        return canvas.toDataURL('image/png');
+    }
+
+    /* Polygon-only image — white background, fills + outlines ("Classified OFF, Polygons ON" view) */
+    function buildPolygonDataURL() {
+        if (!state.features.length || !state.classifiedGrid) return null;
+        var w = state.width, h = state.height;
+        var canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        var ctx = canvas.getContext('2d');
+
+        /* White background — matches having the classified layer turned OFF */
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, w, h);
+
+        /* Helper: lng/lat → pixel */
+        function toPixel(lng, lat) {
+            var x, y;
+            if (Math.abs(state.bbox[0]) > 180) {
+                defineUtm(state.sourceProj);
+                var m = proj4('EPSG:4326', state.sourceProj, [lng, lat]);
+                x = (m[0] - state.bbox[0]) / state.pixelWidth;
+                y = (state.bbox[3] - m[1]) / state.pixelHeight;
+            } else {
+                x = (lng - state.bbox[0]) / state.pixelWidth;
+                y = (state.bbox[3] - lat) / state.pixelHeight;
+            }
+            return [x, y];
+        }
+
+        /* Group all rings per zone */
+        var zoneGroups = {};
+        state.features.forEach(function (feat) {
+            var z = feat.properties.zone;
+            if (!zoneGroups[z]) zoneGroups[z] = { color: feat.properties.color, label: feat.properties.label, rings: [], bbox: [Infinity, Infinity, -Infinity, -Infinity] };
+            feat.geometry.coordinates.forEach(function (ring) {
+                zoneGroups[z].rings.push(ring);
+                ring.forEach(function (pt) {
+                    var px = toPixel(pt[0], pt[1]);
+                    if (px[0] < zoneGroups[z].bbox[0]) zoneGroups[z].bbox[0] = px[0];
+                    if (px[1] < zoneGroups[z].bbox[1]) zoneGroups[z].bbox[1] = px[1];
+                    if (px[0] > zoneGroups[z].bbox[2]) zoneGroups[z].bbox[2] = px[0];
+                    if (px[1] > zoneGroups[z].bbox[3]) zoneGroups[z].bbox[3] = px[1];
+                });
+            });
+        });
+
+        /* Pass 1 — semi-transparent fill (45% opacity) */
+        Object.keys(zoneGroups).forEach(function (z) {
+            var g = zoneGroups[z];
+            var hex = g.color || '#1a9850';
+            var r = parseInt(hex.slice(1, 3), 16);
+            var gv = parseInt(hex.slice(3, 5), 16);
+            var b = parseInt(hex.slice(5, 7), 16);
+            ctx.fillStyle = 'rgba(' + r + ',' + gv + ',' + b + ',0.45)';
+            g.rings.forEach(function (ring) {
+                ctx.beginPath();
+                ring.forEach(function (pt, i) {
+                    var px = toPixel(pt[0], pt[1]);
+                    if (i === 0) ctx.moveTo(px[0], px[1]); else ctx.lineTo(px[0], px[1]);
+                });
+                ctx.closePath();
+                ctx.fill();
+            });
+        });
+
+        /* Pass 2 — solid outlines (2px) */
+        Object.keys(zoneGroups).forEach(function (z) {
+            var g = zoneGroups[z];
+            ctx.strokeStyle = g.color || '#1a9850';
+            ctx.lineWidth = 2;
+            g.rings.forEach(function (ring) {
+                ctx.beginPath();
+                ring.forEach(function (pt, i) {
+                    var px = toPixel(pt[0], pt[1]);
+                    if (i === 0) ctx.moveTo(px[0], px[1]); else ctx.lineTo(px[0], px[1]);
+                });
+                ctx.closePath();
+                ctx.stroke();
+            });
+        });
+
+        /* Pass 3 — zone name labels centered in each zone's pixel bbox */
+        var fontSize = Math.max(10, Math.min(24, Math.round(w / 30)));
+        ctx.font = 'bold ' + fontSize + 'px Inter, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        Object.keys(zoneGroups).forEach(function (z) {
+            var g = zoneGroups[z];
+            if (!isFinite(g.bbox[0])) return;
+            var cx = (g.bbox[0] + g.bbox[2]) / 2;
+            var cy = (g.bbox[1] + g.bbox[3]) / 2;
+            /* Dark outline for legibility */
+            ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+            ctx.lineWidth = 3;
+            ctx.strokeText(g.label, cx, cy);
+            ctx.fillStyle = '#1f2933';
+            ctx.fillText(g.label, cx, cy);
+        });
+
+        return canvas.toDataURL('image/png');
+    }
+
     function exportPDF() {
-        /* Capture the map as an image and generate a simple HTML report that can be printed */
         var printWin = window.open('', '_blank');
         if (!printWin) { alert('Please allow popups for PDF export.'); return; }
 
+        /* ── Build summary data ── */
         var groups = {};
         var totalArea = 0, totalProduct = 0;
         state.features.forEach(function (f) {
@@ -994,42 +1328,121 @@
             groups[z].acres += ac;
         });
         var zonesHtml = '';
-        Object.keys(groups).sort().forEach(function (z) {
+        Object.keys(groups).sort(function (a, b) { return Number(a) - Number(b); }).forEach(function (z) {
             var g = groups[z];
             var rate = state.zoneRates[z] || 0;
             totalProduct += g.acres * rate;
             zonesHtml += '<tr>' +
-                '<td><span style="display:inline-block;width:14px;height:14px;border-radius:4px;background:' + g.color + ';vertical-align:middle"></span> ' + g.label + '</td>' +
+                '<td><span style="display:inline-block;width:12px;height:12px;border-radius:3px;background:' + g.color + ';vertical-align:middle;margin-right:6px"></span>' + g.label + '</td>' +
                 '<td style="text-align:right">' + fmtAcres(g.acres) + ' ac</td>' +
                 '<td style="text-align:right">' + rate + ' ' + state.rxUnit + '</td>' +
-                '<td style="text-align:right">' + (g.acres * rate).toFixed(1) + ' ' + state.rxUnit + '</td>' +
+                '<td style="text-align:right;font-weight:700">' + (g.acres * rate).toFixed(1) + ' ' + state.rxUnit + '</td>' +
                 '</tr>';
         });
 
-        printWin.document.write('<!DOCTYPE html><html><head><title>Prescription Report</title>' +
-            '<style>body{font-family:Inter,Segoe UI,sans-serif;max-width:800px;margin:40px auto;color:#1f2933}' +
-            'h1{font-size:24px;color:#1e8449}h2{font-size:16px;margin-top:32px;color:#27ae60}' +
-            'table{width:100%;border-collapse:collapse;margin-top:12px}th,td{padding:8px 12px;border-bottom:1px solid #e2e6ea;text-align:left}' +
-            'th{background:#f8f9fa;font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:0.5px}' +
-            '.totals{margin-top:20px;padding:16px;background:#f0fdf4;border-radius:12px}' +
-            '.totals p{margin:4px 0;font-size:14px}.totals strong{color:#1e8449}' +
-            '@media print{body{margin:20px}}</style></head><body>' +
-            '<h1>Agroptics Prescription Report</h1>' +
-            '<p><strong>Type:</strong> ' + state.rxType.charAt(0).toUpperCase() + state.rxType.slice(1) + '</p>' +
-            '<p><strong>Unit:</strong> ' + state.rxUnit + '</p>' +
-            '<p><strong>Method:</strong> ' + methodLabel($('zoneMethod').value) + '</p>' +
-            '<p><strong>Zones:</strong> ' + zoneCount() + '</p>' +
-            '<h2>Zone Summary</h2>' +
-            '<table><thead><tr><th>Zone</th><th style="text-align:right">Area</th><th style="text-align:right">Rate</th><th style="text-align:right">Total Product</th></tr></thead>' +
-            '<tbody>' + zonesHtml + '</tbody></table>' +
-            '<div class="totals">' +
-            '<p>Total Area: <strong>' + fmtAcres(totalArea) + ' ac</strong></p>' +
-            '<p>Total Product: <strong>' + totalProduct.toFixed(1) + ' ' + state.rxUnit + '</strong></p>' +
+        /* ── Capture images ── */
+        var classifiedDataURL = buildClassifiedDataURL();
+        var polygonDataURL    = buildPolygonDataURL();
+
+        /* ── Timestamp ── */
+        var now = new Date();
+        var dateStr = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+        /* ── Legend HTML ── */
+        var n = state.currentBreaks ? state.currentBreaks.length + 1 : 3;
+        var legendHtml = '';
+        for (var z = 1; z <= n; z++) {
+            var color = zoneStyle(z, n);
+            var name = zoneName(z, n);
+            var range = state.currentBreaks ? classRange(z, state.currentBreaks, classBounds($('zoneMethod').value)) : { min: 0, max: 1 };
+            legendHtml += '<div style="display:flex;align-items:center;gap:8px;margin-top:6px">' +
+                '<span style="display:inline-block;width:16px;height:16px;border-radius:4px;background:' + color.hex + '"></span>' +
+                '<span style="font-weight:600;font-size:13px">' + name + '</span>' +
+                '<span style="color:#6b7280;font-size:12px">' + fmt(range.min) + ' – ' + fmt(range.max) + '</span>' +
+                '</div>';
+        }
+
+        printWin.document.write('<!DOCTYPE html><html><head>' +
+            '<meta charset="UTF-8"><title>Agroptics Prescription Report</title>' +
+            '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">' +
+            '<style>' +
+            '*{box-sizing:border-box;margin:0;padding:0}' +
+            'body{font-family:Inter,"Segoe UI",sans-serif;background:#fff;color:#1f2933;font-size:13px}' +
+            '.page{max-width:800px;margin:0 auto;padding:40px 32px}' +
+            '.header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #1a9850;padding-bottom:16px;margin-bottom:24px}' +
+            '.header-left h1{font-size:22px;color:#1a9850;font-weight:800;letter-spacing:-0.3px}' +
+            '.header-left p{font-size:12px;color:#6b7280;margin-top:4px}' +
+            '.header-right{text-align:right;font-size:12px;color:#6b7280}' +
+            '.meta-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}' +
+            '.meta-card{background:#f7f8f9;border:1px solid #e2e6ea;border-radius:8px;padding:10px 12px}' +
+            '.meta-card .label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:#9aa3ad;margin-bottom:3px}' +
+            '.meta-card .value{font-size:14px;font-weight:700;color:#1f2933}' +
+            'h2{font-size:14px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:#6b7280;margin-bottom:10px;margin-top:24px}' +
+            '.img-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}' +
+            '.img-box{background:#f7f8f9;border:1px solid #e2e6ea;border-radius:10px;overflow:hidden}' +
+            '.img-box img{width:100%;display:block;object-fit:contain;max-height:240px;background:#2b2b2b}' +
+            '.img-box .caption{font-size:11px;font-weight:600;color:#6b7280;padding:8px 10px;text-align:center;background:#f7f8f9;border-top:1px solid #e2e6ea}' +
+            'table{width:100%;border-collapse:collapse}' +
+            'th,td{padding:8px 12px;border-bottom:1px solid #eef0f2;text-align:left;font-size:12px}' +
+            'th{background:#f7f8f9;font-weight:700;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;color:#6b7280}' +
+            'tr:last-child td{border-bottom:none}' +
+            '.totals-bar{display:flex;gap:16px;margin-top:16px}' +
+            '.total-card{flex:1;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 14px}' +
+            '.total-card .label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:#1a9850;margin-bottom:4px}' +
+            '.total-card .value{font-size:20px;font-weight:800;color:#1a9850}' +
+            '.legend-box{background:#f7f8f9;border:1px solid #e2e6ea;border-radius:8px;padding:12px 14px;margin-bottom:24px}' +
+            '.footer{margin-top:32px;padding-top:16px;border-top:1px solid #e2e6ea;font-size:11px;color:#9aa3ad;display:flex;justify-content:space-between}' +
+            '@media print{.page{padding:20px}.no-break{page-break-inside:avoid}}' +
+            '</style></head><body><div class="page">' +
+            /* Header */
+            '<div class="header">' +
+            '<div class="header-left"><h1>Agroptics Prescription Report</h1><p>' + state.rxType.charAt(0).toUpperCase() + state.rxType.slice(1) + ' Prescription Map</p></div>' +
+            '<div class="header-right"><strong>' + dateStr + '</strong><br>Generated by Agroptics</div>' +
             '</div>' +
-            '<p style="margin-top:40px;font-size:11px;color:#6b7280">Generated by Agroptics Prescription Demo</p>' +
-            '</body></html>');
+            /* Meta cards */
+            '<div class="meta-grid">' +
+            '<div class="meta-card"><div class="label">Rx Type</div><div class="value">' + state.rxType.charAt(0).toUpperCase() + state.rxType.slice(1) + '</div></div>' +
+            '<div class="meta-card"><div class="label">Unit</div><div class="value">' + state.rxUnit + '</div></div>' +
+            '<div class="meta-card"><div class="label">Method</div><div class="value">' + methodLabel($('zoneMethod').value) + '</div></div>' +
+            '<div class="meta-card"><div class="label">Zones</div><div class="value">' + zoneCount() + '</div></div>' +
+            '</div>' +
+            /* Maps — Image 1: Polygons only (Classified layer OFF) | Image 2: Classified raster (Polygons layer OFF) */
+            '<h2>Prescription Maps</h2>' +
+            '<div class="img-grid no-break">' +
+            /* LEFT: Polygons only — "Classified OFF, Polygons ON" */
+            '<div class="img-box">' +
+            (polygonDataURL
+                ? '<img src="' + polygonDataURL + '" alt="Zone Polygons">'
+                : '<div style="height:200px;display:flex;align-items:center;justify-content:center;color:#9aa3ad">No polygons</div>') +
+            '<div class="caption">Zone Polygons &nbsp;·&nbsp; Classified layer OFF</div></div>' +
+            /* RIGHT: Classified raster — "Polygons OFF, Classified ON" */
+            '<div class="img-box">' +
+            (classifiedDataURL
+                ? '<img src="' + classifiedDataURL + '" alt="Classified Raster">'
+                : '<div style="height:200px;display:flex;align-items:center;justify-content:center;color:#9aa3ad">No image</div>') +
+            '<div class="caption">Classified Raster &nbsp;·&nbsp; Polygons layer OFF</div></div>' +
+            '</div>' +
+            /* Legend */
+            '<h2>Zone Legend</h2>' +
+            '<div class="legend-box no-break">' + legendHtml + '</div>' +
+            /* Table */
+            '<h2>Zone Summary</h2>' +
+            '<div class="no-break"><table><thead><tr>' +
+            '<th>Zone</th><th style="text-align:right">Area (ac)</th>' +
+            '<th style="text-align:right">Rate (' + state.rxUnit + ')</th>' +
+            '<th style="text-align:right">Total Product</th>' +
+            '</tr></thead><tbody>' + zonesHtml + '</tbody></table></div>' +
+            /* Totals */
+            '<div class="totals-bar no-break">' +
+            '<div class="total-card"><div class="label">Total Area</div><div class="value">' + fmtAcres(totalArea) + ' ac</div></div>' +
+            '<div class="total-card"><div class="label">Total Product</div><div class="value">' + totalProduct.toFixed(1) + ' ' + state.rxUnit + '</div></div>' +
+            '</div>' +
+            /* Footer */
+            '<div class="footer"><span>Agroptics Prescription Demo</span><span>' + dateStr + '</span></div>' +
+            '</div></body></html>');
         printWin.document.close();
-        setTimeout(function () { printWin.print(); }, 500);
+        /* Small delay to let fonts/images render before print dialog */
+        setTimeout(function () { printWin.print(); }, 800);
     }
 
     /* ═══════════ EXPORT — Classified Image ══════════════════════ */
