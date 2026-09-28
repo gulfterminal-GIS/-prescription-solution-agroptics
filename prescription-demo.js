@@ -1,13 +1,15 @@
 /**
- * Agroptics zone demo
- * Loads a ready index GeoTIFF (single band) and splits it into
- * the number of management zones the user picks.
+ * Agroptics Prescription Demo — v3.0
+ * Loads a single-band index GeoTIFF and splits it into prescription zones.
+ * Supports: prescription types, editable rates, smoothing, multiple exports.
  */
 (function () {
     'use strict';
 
+    /* ═══════════ CONSTANTS ══════════════════════════════════════ */
     var DEFAULT_TIF = 'https://satalite-images-04-2026.s3.eu-north-1.amazonaws.com/Individual/amhashem85-gmail.com/Dina_Farms/Takwa_1_correct/851e9092-44e4-49c8-9e89-d6974b9bf03c/processed/2026-06-26_084002/NDVI.tif';
     var ACRES_PER_M2 = 0.000247105;
+    var HA_PER_M2 = 0.0001;
     var CLASS_NAMES = [null, 'Low', 'Medium', 'High'];
     var CLASS_COLORS = [
         null,
@@ -25,6 +27,37 @@
         [26, 152, 80]
     ];
 
+    /* Prescription type configuration */
+    var RX_UNITS = {
+        irrigation: [
+            { value: 'inch', label: 'inch' },
+            { value: 'mm', label: 'mm' }
+        ],
+        seeding: [
+            { value: 'seeds/ac', label: 'seeds/ac' }
+        ],
+        fertilizer: [
+            { value: 'lb/ac', label: 'lb/ac (solid)' },
+            { value: 'kg/ha', label: 'kg/ha (solid)' },
+            { value: 'gal/ac', label: 'gal/ac (liquid)' },
+            { value: 'L/ha', label: 'L/ha (liquid)' }
+        ],
+        herbicide: [
+            { value: 'lb/ac', label: 'lb/ac (solid)' },
+            { value: 'kg/ha', label: 'kg/ha (solid)' },
+            { value: 'gal/ac', label: 'gal/ac (liquid)' },
+            { value: 'L/ha', label: 'L/ha (liquid)' }
+        ]
+    };
+
+    var RX_DEFAULT_RATES = {
+        irrigation: [0, 0.5, 0.8, 1.0, 1.2],
+        seeding: [0, 28000, 32000, 34000, 36000],
+        fertilizer: [0, 80, 120, 160, 200],
+        herbicide: [0, 12, 16, 20, 24]
+    };
+
+    /* ═══════════ STATE ══════════════════════════════════════════ */
     var state = {
         map: null,
         ndviLayer: null,
@@ -40,23 +73,37 @@
         pixelHeight: 3,
         stats: null,
         features: [],
-        regenTimer: null
+        regenTimer: null,
+        classifiedGrid: null,
+        currentBreaks: null,
+        rxType: 'irrigation',
+        rxUnit: 'inch',
+        zoneRates: {}
     };
 
-    function $(id) {
-        return document.getElementById(id);
-    }
+    /* ═══════════ HELPERS ════════════════════════════════════════ */
+    function $(id) { return document.getElementById(id); }
 
     function setMessage(text) {
         var el = $('mapMessage');
-        if (!text) {
-            el.classList.add('hidden');
-            return;
-        }
+        if (!text) { el.classList.add('hidden'); return; }
         el.textContent = text;
         el.classList.remove('hidden');
     }
 
+    function fmt(v) {
+        var n = Number(v);
+        if (Math.abs(n * 10 - Math.round(n * 10)) < 1e-6) return n.toFixed(1);
+        return n.toFixed(2);
+    }
+
+    function fmtAcres(v) {
+        if (v >= 100) return String(Math.round(v));
+        if (v >= 10) return v.toFixed(1);
+        return v.toFixed(2);
+    }
+
+    /* ═══════════ MAP INIT ═══════════════════════════════════════ */
     function initMap() {
         state.map = L.map('map', {
             zoomControl: false,
@@ -73,6 +120,7 @@
         }).addTo(state.map);
     }
 
+    /* ═══════════ PROJECTION ═════════════════════════════════════ */
     function defineUtm(code) {
         var m = String(code).match(/EPSG:(326|327)(\d{2})/);
         if (!m) return;
@@ -99,17 +147,14 @@
         return [x, y];
     }
 
-    /* Same RdYlGn interpolation as GTAgropticsLeaflet.rdylgnColor */
+    /* ═══════════ COLOR ══════════════════════════════════════════ */
     function rdylgnColor(t) {
         t = Math.max(0, Math.min(1, t));
         var index = t * (RDYLGN.length - 1);
         var i = Math.floor(index);
         var f = index - i;
-        if (i >= RDYLGN.length - 1) {
-            return { r: RDYLGN[6][0], g: RDYLGN[6][1], b: RDYLGN[6][2] };
-        }
-        var c1 = RDYLGN[i];
-        var c2 = RDYLGN[i + 1];
+        if (i >= RDYLGN.length - 1) return { r: RDYLGN[6][0], g: RDYLGN[6][1], b: RDYLGN[6][2] };
+        var c1 = RDYLGN[i], c2 = RDYLGN[i + 1];
         return {
             r: Math.round(c1[0] + f * (c2[0] - c1[0])),
             g: Math.round(c1[1] + f * (c2[1] - c1[1])),
@@ -117,6 +162,21 @@
         };
     }
 
+    function zoneStyle(z, n) {
+        if (n === 3) return CLASS_COLORS[z];
+        var t = n <= 1 ? 1 : (z - 1) / (n - 1);
+        var c = rdylgnColor(t);
+        var hex = '#' + [c.r, c.g, c.b].map(function (x) { return ('0' + x.toString(16)).slice(-2); }).join('');
+        return { r: c.r, g: c.g, b: c.b, hex: hex };
+    }
+
+    function zoneName(z, n) {
+        if (n === 3) return CLASS_NAMES[z];
+        if (n === 2) return z === 1 ? 'Low' : 'High';
+        return 'Zone ' + z;
+    }
+
+    /* ═══════════ GEOTIFF PARSING ════════════════════════════════ */
     async function parseGeoTIFF(buffer, fileName) {
         var tiff = await GeoTIFF.fromArrayBuffer(buffer);
         var image = await tiff.getImage();
@@ -138,10 +198,7 @@
 
         for (var i = 0; i < width * height; i++) {
             var v = Number(band[i]);
-            if (!isFinite(v)) {
-                valuesGrid[i] = NaN;
-                continue;
-            }
+            if (!isFinite(v)) { valuesGrid[i] = NaN; continue; }
             valuesGrid[i] = v;
             valid[i] = 1;
             if (v < min) min = v;
@@ -167,13 +224,28 @@
         await generateZones();
     }
 
+    /* ═══════════ CLASSIFICATION ═════════════════════════════════ */
     function zoneCount() {
         var n = Number($('zoneCount').value);
         if (n !== 2 && n !== 3 && n !== 4 && n !== 5) n = 3;
         return n;
     }
 
+    function getCustomBreaks(n) {
+        var inputs = document.querySelectorAll('#breakEditor input');
+        var breaks = [];
+        for (var i = 0; i < inputs.length; i++) {
+            var v = parseFloat(inputs[i].value);
+            if (isFinite(v)) breaks.push(v);
+        }
+        breaks.sort(function (a, b) { return a - b; });
+        return breaks;
+    }
+
     function tableBreaks(n) {
+        var custom = getCustomBreaks(n);
+        if (custom.length === n - 1) return custom;
+        /* Fallback defaults */
         if (n === 3) return [0.4, 0.7];
         var breaks = [];
         for (var i = 1; i < n; i++) breaks.push(i / n);
@@ -185,76 +257,6 @@
         var breaks = [];
         for (var i = 1; i < n; i++) breaks.push(min + step * i);
         return breaks;
-    }
-
-    function chooseBreaks(method, n) {
-        if (method === 'quantile') return quantileBreaks(state.stats.values, n);
-        if (method === 'equal') return equalIntervalBreaks(state.stats.min, state.stats.max, n);
-        if (method === 'table') return tableBreaks(n);
-        var breaks = jenksBreaks(state.stats.values, n);
-        if (!breaks.length) return quantileBreaks(state.stats.values, n);
-        return breaks;
-    }
-
-    function classBounds(method) {
-        if (method === 'table') return { min: 0, max: 1 };
-        return { min: state.stats.min, max: state.stats.max };
-    }
-
-    function methodLabel(method) {
-        if (method === 'quantile') return 'Quantile';
-        if (method === 'equal') return 'Equal interval';
-        if (method === 'table') return 'Reclassify by table';
-        return 'Natural Breaks';
-    }
-
-    function zoneStyle(z, n) {
-        if (n === 3) return CLASS_COLORS[z];
-        var t = n <= 1 ? 1 : (z - 1) / (n - 1);
-        var c = rdylgnColor(t);
-        var hex = '#' + [c.r, c.g, c.b].map(function (x) {
-            return ('0' + x.toString(16)).slice(-2);
-        }).join('');
-        return { r: c.r, g: c.g, b: c.b, hex: hex };
-    }
-
-    function zoneName(z, n) {
-        if (n === 3) return CLASS_NAMES[z];
-        if (n === 2) return z === 1 ? 'Low' : 'High';
-        return 'Zone ' + z;
-    }
-
-    function showClassOverlay(grid, n) {
-        if (!state.ndvi || !state.bounds) return;
-        if (state.ndviLayer) {
-            state.map.removeLayer(state.ndviLayer);
-            state.ndviLayer = null;
-        }
-        var canvas = document.createElement('canvas');
-        canvas.width = state.width;
-        canvas.height = state.height;
-        var ctx = canvas.getContext('2d');
-        var img = ctx.createImageData(state.width, state.height);
-        var colors = [];
-        for (var z = 1; z <= n; z++) colors[z] = zoneStyle(z, n);
-        for (var i = 0; i < grid.length; i++) {
-            var o = i * 4;
-            var cls = grid[i];
-            if (!cls || !colors[cls]) {
-                img.data[o + 3] = 0;
-                continue;
-            }
-            img.data[o] = colors[cls].r;
-            img.data[o + 1] = colors[cls].g;
-            img.data[o + 2] = colors[cls].b;
-            img.data[o + 3] = 255;
-        }
-        ctx.putImageData(img, 0, 0);
-        state.ndviLayer = L.imageOverlay(canvas.toDataURL('image/png'), state.bounds, {
-            opacity: 0.85,
-            interactive: false
-        }).addTo(state.map);
-        applyLayers();
     }
 
     function uniqueSorted(arr) {
@@ -281,8 +283,7 @@
         data.sort(function (a, b) { return a - b; });
         var n = data.length;
         nClasses = Math.max(2, Math.min(nClasses, n));
-        var lowerClassLimits = [];
-        var varianceCombinations = [];
+        var lowerClassLimits = [], varianceCombinations = [];
         var i, j;
         for (i = 0; i <= n; i++) {
             lowerClassLimits[i] = [];
@@ -329,6 +330,27 @@
         return uniqueSorted(kclass.slice(0, nClasses - 1)).sort(function (a, b) { return a - b; });
     }
 
+    function chooseBreaks(method, n) {
+        if (method === 'quantile') return quantileBreaks(state.stats.values, n);
+        if (method === 'equal') return equalIntervalBreaks(state.stats.min, state.stats.max, n);
+        if (method === 'table') return tableBreaks(n);
+        var breaks = jenksBreaks(state.stats.values, n);
+        if (!breaks.length) return quantileBreaks(state.stats.values, n);
+        return breaks;
+    }
+
+    function classBounds(method) {
+        if (method === 'table') return { min: 0, max: 1 };
+        return { min: state.stats.min, max: state.stats.max };
+    }
+
+    function methodLabel(method) {
+        if (method === 'quantile') return 'Quantile';
+        if (method === 'equal') return 'Equal Interval';
+        if (method === 'table') return 'Reclassify by Table';
+        return 'Natural Breaks';
+    }
+
     function classFromValue(v, breaks) {
         for (var i = 0; i < breaks.length; i++) {
             if (v < breaks[i]) return i + 1;
@@ -348,15 +370,14 @@
         return Math.abs(state.pixelWidth * state.pixelHeight) * ACRES_PER_M2;
     }
 
+    /* ═══════════ SIEVE ══════════════════════════════════════════ */
     function sieveSmallComponents(grid, minAcres) {
         if (!(minAcres > 0)) return grid;
-        var w = state.width;
-        var h = state.height;
+        var w = state.width, h = state.height;
         var minPixels = Math.max(1, Math.round(minAcres / pixelAreaAcres()));
         for (var pass = 0; pass < 8; pass++) {
             var labels = new Int32Array(w * h);
-            var sizes = [0];
-            var clsOf = [0];
+            var sizes = [0], clsOf = [0];
             var current = 0;
             for (var i = 0; i < w * h; i++) {
                 if (grid[i] <= 0 || labels[i]) continue;
@@ -404,10 +425,7 @@
                 }
                 var best = 0, bestN = 0;
                 Object.keys(votes).forEach(function (k) {
-                    if (votes[k] > bestN) {
-                        bestN = votes[k];
-                        best = Number(k);
-                    }
+                    if (votes[k] > bestN) { bestN = votes[k]; best = Number(k); }
                 });
                 if (!best) return;
                 for (var q = 0; q < w * h; q++) {
@@ -418,9 +436,9 @@
         return grid;
     }
 
+    /* ═══════════ VECTORIZE ══════════════════════════════════════ */
     function collectRings(grid, cls) {
-        var w = state.width;
-        var h = state.height;
+        var w = state.width, h = state.height;
         var edges = new Map();
         function add(x1, y1, x2, y2) {
             var k = x1 + ',' + y1;
@@ -528,6 +546,37 @@
         return polygons;
     }
 
+    /* ═══════════ SMOOTHING ══════════════════════════════════════ */
+    function smoothRing(ring, iterations) {
+        if (!iterations || ring.length < 4) return ring;
+        var result = ring;
+        for (var iter = 0; iter < iterations; iter++) {
+            var newRing = [result[0]];
+            for (var i = 0; i < result.length - 1; i++) {
+                var p0 = result[i];
+                var p1 = result[(i + 1) % (result.length - 1)] || result[i + 1];
+                newRing.push([
+                    0.75 * p0[0] + 0.25 * p1[0],
+                    0.75 * p0[1] + 0.25 * p1[1]
+                ]);
+                newRing.push([
+                    0.25 * p0[0] + 0.75 * p1[0],
+                    0.25 * p0[1] + 0.75 * p1[1]
+                ]);
+            }
+            newRing.push(newRing[0].slice());
+            result = newRing;
+        }
+        return result;
+    }
+
+    function smoothPolygonCoords(coords, iterations) {
+        return coords.map(function (ring) {
+            return smoothRing(ring, iterations);
+        });
+    }
+
+    /* ═══════════ ZONE BUILDING ══════════════════════════════════ */
     function classRange(z, breaks, bounds) {
         var n = breaks.length + 1;
         if (z <= 1) return { min: bounds.min, max: breaks[0] };
@@ -562,6 +611,7 @@
     function polygonizeZones(grid, breaks, method, aggValues) {
         var features = [];
         var n = breaks.length + 1;
+        var doSmooth = $('smoothToggle') && $('smoothToggle').checked;
         for (var z = 1; z <= n; z++) {
             var pixelRings = collectRings(grid, z);
             if (!pixelRings.length) continue;
@@ -574,7 +624,9 @@
             var name = zoneName(z, n);
             var agg = aggValues[z];
             polys.forEach(function (coords) {
-                var geom = { type: 'Polygon', coordinates: coords };
+                /* Apply smoothing if enabled */
+                var finalCoords = doSmooth ? smoothPolygonCoords(coords, 2) : coords;
+                var geom = { type: 'Polygon', coordinates: finalCoords };
                 var areaM2 = 0;
                 try { areaM2 = turf.area(turf.feature(geom)); } catch (e) { areaM2 = 0; }
                 features.push({
@@ -586,7 +638,11 @@
                         ndvi_max: Number(range.max.toFixed(4)),
                         ndvi_value: agg == null ? null : Number(agg.toFixed(4)),
                         area_acres: Number((areaM2 * ACRES_PER_M2).toFixed(4)),
-                        color: color.hex
+                        area_ha: Number((areaM2 * HA_PER_M2).toFixed(4)),
+                        color: color.hex,
+                        rx_type: state.rxType,
+                        rx_unit: state.rxUnit,
+                        rate: state.zoneRates[z] || 0
                     },
                     geometry: geom
                 });
@@ -595,6 +651,38 @@
         return features;
     }
 
+    /* ═══════════ RENDER CLASSIFIED IMAGE ════════════════════════ */
+    function showClassOverlay(grid, n) {
+        if (!state.ndvi || !state.bounds) return;
+        if (state.ndviLayer) {
+            state.map.removeLayer(state.ndviLayer);
+            state.ndviLayer = null;
+        }
+        var canvas = document.createElement('canvas');
+        canvas.width = state.width;
+        canvas.height = state.height;
+        var ctx = canvas.getContext('2d');
+        var img = ctx.createImageData(state.width, state.height);
+        var colors = [];
+        for (var z = 1; z <= n; z++) colors[z] = zoneStyle(z, n);
+        for (var i = 0; i < grid.length; i++) {
+            var o = i * 4;
+            var cls = grid[i];
+            if (!cls || !colors[cls]) { img.data[o + 3] = 0; continue; }
+            img.data[o] = colors[cls].r;
+            img.data[o + 1] = colors[cls].g;
+            img.data[o + 2] = colors[cls].b;
+            img.data[o + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+        state.ndviLayer = L.imageOverlay(canvas.toDataURL('image/png'), state.bounds, {
+            opacity: 0.85,
+            interactive: false
+        }).addTo(state.map);
+        applyLayers();
+    }
+
+    /* ═══════════ RENDER ZONE POLYGONS ═══════════════════════════ */
     function renderZones(features) {
         if (state.zoneLayer) {
             state.map.removeLayer(state.zoneLayer);
@@ -612,9 +700,11 @@
                 };
             }
         }).addTo(state.map);
-        $('exportGeojsonBtn').disabled = features.length === 0;
+        $('exportBtn').disabled = features.length === 0;
         applyLayers();
         updateChart(features);
+        updateRatesUI(features);
+        updateTotals(features);
     }
 
     function applyLayers() {
@@ -625,112 +715,11 @@
 
     function toggleMapLayer(layer, on) {
         if (!layer || !state.map) return;
-        if (on) {
-            if (!state.map.hasLayer(layer)) layer.addTo(state.map);
-        } else if (state.map.hasLayer(layer)) {
-            state.map.removeLayer(layer);
-        }
+        if (on) { if (!state.map.hasLayer(layer)) layer.addTo(state.map); }
+        else if (state.map.hasLayer(layer)) { state.map.removeLayer(layer); }
     }
 
-    function fmtAcres(v) {
-        if (v >= 100) return String(Math.round(v));
-        if (v >= 10) return v.toFixed(1);
-        return v.toFixed(2);
-    }
-
-    function updateChart(features) {
-        var host = $('zoneChart');
-        var list = $('chartList');
-        host.innerHTML = '';
-        list.innerHTML = '';
-        var groups = {};
-        features.forEach(function (f) {
-            var z = f.properties.zone;
-            if (!groups[z]) {
-                groups[z] = {
-                    zone: z,
-                    label: f.properties.label,
-                    color: f.properties.color,
-                    acres: 0,
-                    value: f.properties.ndvi_value
-                };
-            }
-            groups[z].acres += Number(f.properties.area_acres) || 0;
-        });
-        var slices = Object.keys(groups).map(function (k) { return groups[k]; });
-        slices.sort(function (a, b) { return a.zone - b.zone; });
-        var total = slices.reduce(function (sum, s) { return sum + s.acres; }, 0);
-        if (!slices.length || !(total > 0)) {
-            host.innerHTML = '<div class="chart-empty">No areas</div>';
-            return;
-        }
-
-        var svgNS = 'http://www.w3.org/2000/svg';
-        var size = 210;
-        var cx = 105;
-        var cy = 105;
-        var radius = 62;
-        var circ = 2 * Math.PI * radius;
-        var svg = document.createElementNS(svgNS, 'svg');
-        svg.setAttribute('viewBox', '0 0 ' + size + ' ' + size);
-        var drawn = 0;
-        slices.forEach(function (slice, index) {
-            var len = index === slices.length - 1 ? Math.max(0, circ - drawn) : (slice.acres / total) * circ;
-            var ring = document.createElementNS(svgNS, 'circle');
-            ring.setAttribute('cx', cx);
-            ring.setAttribute('cy', cy);
-            ring.setAttribute('r', radius);
-            ring.setAttribute('fill', 'none');
-            ring.setAttribute('stroke', slice.color);
-            ring.setAttribute('stroke-width', '26');
-            ring.setAttribute('stroke-dasharray', len + ' ' + Math.max(0, circ - len));
-            ring.setAttribute('stroke-dashoffset', String(-drawn));
-            ring.setAttribute('transform', 'rotate(-90 ' + cx + ' ' + cy + ')');
-            svg.appendChild(ring);
-
-            var mid = -Math.PI / 2 + ((drawn + len / 2) / circ) * Math.PI * 2;
-            var lx = cx + Math.cos(mid) * 92;
-            var ly = cy + Math.sin(mid) * 92;
-            if (len / circ >= 0.06) {
-                var label = document.createElementNS(svgNS, 'text');
-                label.setAttribute('x', lx);
-                label.setAttribute('y', ly);
-                label.setAttribute('text-anchor', lx > cx + 8 ? 'start' : (lx < cx - 8 ? 'end' : 'middle'));
-                label.setAttribute('dominant-baseline', 'middle');
-                label.setAttribute('fill', '#1f2933');
-                label.setAttribute('font-size', '11');
-                label.setAttribute('font-weight', '700');
-                label.setAttribute('font-family', 'Segoe UI, Tahoma, Arial, sans-serif');
-                label.textContent = fmtAcres(slice.acres);
-                svg.appendChild(label);
-            }
-            drawn += len;
-        });
-        host.appendChild(svg);
-
-        var center = document.createElement('div');
-        center.className = 'donut-center';
-        center.innerHTML = '<strong>' + fmtAcres(total) + '</strong><span>ac</span>';
-        host.appendChild(center);
-
-        slices.forEach(function (slice) {
-            var row = document.createElement('div');
-            row.className = 'chart-row';
-            row.innerHTML = '<span class="chart-dot" style="background:' + slice.color + '"></span>' +
-                '<span>' + slice.zone + ' ' + slice.label +
-                    (slice.value == null ? '' : '<span class="chart-agg">' + ($('zoneAgg').value === 'median' ? 'Median' : 'Average') + ' ' + fmt(slice.value) + '</span>') +
-                '</span>' +
-                '<span class="chart-acres">' + fmtAcres(slice.acres) + ' ac</span>';
-            list.appendChild(row);
-        });
-    }
-
-    function fmt(v) {
-        var n = Number(v);
-        if (Math.abs(n * 10 - Math.round(n * 10)) < 1e-6) return n.toFixed(1);
-        return n.toFixed(2);
-    }
-
+    /* ═══════════ LEGEND ═════════════════════════════════════════ */
     function updateLegend(breaks) {
         var n = breaks.length + 1;
         var bar = $('legendBar');
@@ -753,17 +742,162 @@
             row.className = 'legend-row';
             row.innerHTML = '<span class="swatch" style="background:' + color.hex + '"></span>' +
                 '<span>' + name + '</span>' +
-                '<span class="legend-range">' + fmt(range.min) + ' to ' + fmt(range.max) + '</span>';
+                '<span class="legend-range">' + fmt(range.min) + ' – ' + fmt(range.max) + '</span>';
             rows.appendChild(row);
         }
         var bounds = classBounds($('zoneMethod').value);
         var marks = [bounds.min].concat(breaks).concat([bounds.max]);
-        ticks.innerHTML = marks.map(function (v) {
-            return '<span>' + fmt(v) + '</span>';
-        }).join('');
+        ticks.innerHTML = marks.map(function (v) { return '<span>' + fmt(v) + '</span>'; }).join('');
         $('legendTitle').textContent = methodLabel($('zoneMethod').value);
     }
 
+    /* ═══════════ CHART ══════════════════════════════════════════ */
+    function updateChart(features) {
+        var host = $('zoneChart');
+        var list = $('chartList');
+        host.innerHTML = '';
+        list.innerHTML = '';
+        var groups = {};
+        features.forEach(function (f) {
+            var z = f.properties.zone;
+            if (!groups[z]) {
+                groups[z] = { zone: z, label: f.properties.label, color: f.properties.color, acres: 0, value: f.properties.ndvi_value };
+            }
+            groups[z].acres += Number(f.properties.area_acres) || 0;
+        });
+        var slices = Object.keys(groups).map(function (k) { return groups[k]; });
+        slices.sort(function (a, b) { return a.zone - b.zone; });
+        var total = slices.reduce(function (sum, s) { return sum + s.acres; }, 0);
+        if (!slices.length || !(total > 0)) {
+            host.innerHTML = '<div class="chart-empty">No areas</div>';
+            return;
+        }
+
+        var svgNS = 'http://www.w3.org/2000/svg';
+        var size = 200, cx = 100, cy = 100, radius = 58;
+        var circ = 2 * Math.PI * radius;
+        var svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('viewBox', '0 0 ' + size + ' ' + size);
+        var drawn = 0;
+        slices.forEach(function (slice, index) {
+            var len = index === slices.length - 1 ? Math.max(0, circ - drawn) : (slice.acres / total) * circ;
+            var ring = document.createElementNS(svgNS, 'circle');
+            ring.setAttribute('cx', cx);
+            ring.setAttribute('cy', cy);
+            ring.setAttribute('r', radius);
+            ring.setAttribute('fill', 'none');
+            ring.setAttribute('stroke', slice.color);
+            ring.setAttribute('stroke-width', '24');
+            ring.setAttribute('stroke-dasharray', len + ' ' + Math.max(0, circ - len));
+            ring.setAttribute('stroke-dashoffset', String(-drawn));
+            ring.setAttribute('transform', 'rotate(-90 ' + cx + ' ' + cy + ')');
+            svg.appendChild(ring);
+
+            var mid = -Math.PI / 2 + ((drawn + len / 2) / circ) * Math.PI * 2;
+            var lx = cx + Math.cos(mid) * 86;
+            var ly = cy + Math.sin(mid) * 86;
+            if (len / circ >= 0.06) {
+                var label = document.createElementNS(svgNS, 'text');
+                label.setAttribute('x', lx);
+                label.setAttribute('y', ly);
+                label.setAttribute('text-anchor', lx > cx + 8 ? 'start' : (lx < cx - 8 ? 'end' : 'middle'));
+                label.setAttribute('dominant-baseline', 'middle');
+                label.setAttribute('fill', '#e4e8ee');
+                label.setAttribute('font-size', '11');
+                label.setAttribute('font-weight', '700');
+                label.setAttribute('font-family', 'Inter, sans-serif');
+                label.textContent = fmtAcres(slice.acres);
+                svg.appendChild(label);
+            }
+            drawn += len;
+        });
+        host.appendChild(svg);
+
+        var center = document.createElement('div');
+        center.className = 'donut-center';
+        center.innerHTML = '<strong>' + fmtAcres(total) + '</strong><span>ac</span>';
+        host.appendChild(center);
+
+        slices.forEach(function (slice) {
+            var row = document.createElement('div');
+            row.className = 'chart-row';
+            row.innerHTML = '<span class="chart-dot" style="background:' + slice.color + '"></span>' +
+                '<span>' + slice.zone + ' ' + slice.label +
+                (slice.value == null ? '' : '<span class="chart-agg">' + ($('zoneAgg').value === 'median' ? 'Median' : 'Average') + ' ' + fmt(slice.value) + '</span>') +
+                '</span>' +
+                '<span class="chart-acres">' + fmtAcres(slice.acres) + ' ac</span>';
+            list.appendChild(row);
+        });
+    }
+
+    /* ═══════════ RATES UI ═══════════════════════════════════════ */
+    function updateRatesUI(features) {
+        var list = $('ratesList');
+        list.innerHTML = '';
+        var groups = {};
+        features.forEach(function (f) {
+            var z = f.properties.zone;
+            if (!groups[z]) groups[z] = { zone: z, label: f.properties.label, color: f.properties.color };
+        });
+        var zones = Object.keys(groups).map(function (k) { return groups[k]; });
+        zones.sort(function (a, b) { return a.zone - b.zone; });
+        var defaults = RX_DEFAULT_RATES[state.rxType] || [0, 0, 0, 0, 0];
+
+        zones.forEach(function (z) {
+            if (state.zoneRates[z.zone] == null) {
+                state.zoneRates[z.zone] = defaults[z.zone] || 0;
+            }
+            var row = document.createElement('div');
+            row.className = 'rate-row';
+            row.innerHTML =
+                '<span class="rate-dot" style="background:' + z.color + '"></span>' +
+                '<span class="rate-label">' + z.label + '</span>' +
+                '<div class="rate-input-wrap">' +
+                    '<input type="number" min="0" step="any" value="' + (state.zoneRates[z.zone] || '') + '" data-zone="' + z.zone + '" />' +
+                    '<span class="rate-unit">' + state.rxUnit + '</span>' +
+                '</div>';
+            list.appendChild(row);
+            row.querySelector('input').addEventListener('input', function (e) {
+                state.zoneRates[z.zone] = parseFloat(e.target.value) || 0;
+                /* Update feature properties */
+                state.features.forEach(function (f) {
+                    if (f.properties.zone === z.zone) f.properties.rate = state.zoneRates[z.zone];
+                });
+                updateTotals(state.features);
+            });
+        });
+    }
+
+    /* ═══════════ TOTALS ═════════════════════════════════════════ */
+    function updateTotals(features) {
+        var grid = $('totalsGrid');
+        grid.innerHTML = '';
+        var totalArea = 0, totalProduct = 0;
+        var groups = {};
+        features.forEach(function (f) {
+            var z = f.properties.zone;
+            var ac = Number(f.properties.area_acres) || 0;
+            totalArea += ac;
+            if (!groups[z]) groups[z] = { acres: 0, rate: state.zoneRates[z] || 0 };
+            groups[z].acres += ac;
+        });
+        Object.keys(groups).forEach(function (z) {
+            totalProduct += groups[z].acres * groups[z].rate;
+        });
+
+        var rows = [
+            { label: 'Total area', value: fmtAcres(totalArea) + ' ac' },
+            { label: 'Total product', value: totalProduct.toFixed(1) + ' ' + state.rxUnit }
+        ];
+        rows.forEach(function (r) {
+            var row = document.createElement('div');
+            row.className = 'total-row';
+            row.innerHTML = '<span class="total-label">' + r.label + '</span><span class="total-value">' + r.value + '</span>';
+            grid.appendChild(row);
+        });
+    }
+
+    /* ═══════════ ZONE GENERATION ════════════════════════════════ */
     async function generateZones() {
         if (!state.ndvi) return;
         setMessage('Building zones');
@@ -778,6 +912,8 @@
             var minAcres = Number($('minAcres').value);
             if (!isFinite(minAcres) || minAcres < 0) minAcres = 0;
             sieveSmallComponents(grid, minAcres);
+            state.classifiedGrid = grid;
+            state.currentBreaks = breaks;
             var aggValues = zoneAggregate(grid, $('zoneAgg').value);
             var features = polygonizeZones(grid, breaks, method, aggValues);
             if (!features.length) throw new Error('No polygons. Lower the minimum polygon size.');
@@ -791,10 +927,11 @@
         }
     }
 
+    /* ═══════════ EXPORT — GeoJSON ═══════════════════════════════ */
     function exportGeoJSON() {
         var fc = {
             type: 'FeatureCollection',
-            name: 'ndvi_vigor_zones',
+            name: state.rxType + '_prescription_zones',
             features: state.features.map(function (f, i) {
                 return {
                     type: 'Feature',
@@ -805,30 +942,203 @@
                         ndvi_min: f.properties.ndvi_min,
                         ndvi_max: f.properties.ndvi_max,
                         ndvi_value: f.properties.ndvi_value,
-                        area_acres: f.properties.area_acres
+                        area_acres: f.properties.area_acres,
+                        area_ha: f.properties.area_ha,
+                        rx_type: state.rxType,
+                        rate: state.zoneRates[f.properties.zone] || 0,
+                        unit: state.rxUnit
                     },
                     geometry: f.geometry
                 };
             })
         };
         var blob = new Blob([JSON.stringify(fc, null, 2)], { type: 'application/geo+json' });
+        downloadBlob(blob, state.rxType + '_prescription.geojson');
+    }
+
+    /* ═══════════ EXPORT — Shapefile ═════════════════════════════ */
+    function exportShapefile() {
+        /* Minimal shapefile writer — .shp + .shx + .dbf + .prj in a zip-like download */
+        /* Since we don't have a shapefile library in the demo, we export as GeoJSON with
+           a .zip extension note. For full shapefile, the backend will handle it. */
+        /* We create a simple combined download of GeoJSON with shapefile-ready attributes */
+        var fc = {
+            type: 'FeatureCollection',
+            name: state.rxType + '_VRA',
+            features: state.features.map(function (f, i) {
+                return {
+                    type: 'Feature',
+                    properties: {
+                        FID: i + 1,
+                        Zone: f.properties.zone,
+                        Label: f.properties.label,
+                        Rate: state.zoneRates[f.properties.zone] || 0,
+                        Unit: state.rxUnit,
+                        Area_ac: f.properties.area_acres,
+                        Area_ha: f.properties.area_ha,
+                        Idx_min: f.properties.ndvi_min,
+                        Idx_max: f.properties.ndvi_max,
+                        Rx_type: state.rxType
+                    },
+                    geometry: f.geometry
+                };
+            })
+        };
+        var blob = new Blob([JSON.stringify(fc, null, 2)], { type: 'application/geo+json' });
+        downloadBlob(blob, state.rxType + '_VRA_shapefile_ready.geojson');
+        alert('Shapefile export: In the full Agroptics system, this will generate .shp/.shx/.dbf/.prj files. Currently exported as GeoJSON with shapefile-compatible attributes.');
+    }
+
+    /* ═══════════ EXPORT — PDF Report ════════════════════════════ */
+    function exportPDF() {
+        /* Capture the map as an image and generate a simple HTML report that can be printed */
+        var printWin = window.open('', '_blank');
+        if (!printWin) { alert('Please allow popups for PDF export.'); return; }
+
+        var groups = {};
+        var totalArea = 0, totalProduct = 0;
+        state.features.forEach(function (f) {
+            var z = f.properties.zone;
+            var ac = Number(f.properties.area_acres) || 0;
+            totalArea += ac;
+            if (!groups[z]) groups[z] = { zone: z, label: f.properties.label, color: f.properties.color, acres: 0 };
+            groups[z].acres += ac;
+        });
+        var zonesHtml = '';
+        Object.keys(groups).sort().forEach(function (z) {
+            var g = groups[z];
+            var rate = state.zoneRates[z] || 0;
+            totalProduct += g.acres * rate;
+            zonesHtml += '<tr>' +
+                '<td><span style="display:inline-block;width:14px;height:14px;border-radius:4px;background:' + g.color + ';vertical-align:middle"></span> ' + g.label + '</td>' +
+                '<td style="text-align:right">' + fmtAcres(g.acres) + ' ac</td>' +
+                '<td style="text-align:right">' + rate + ' ' + state.rxUnit + '</td>' +
+                '<td style="text-align:right">' + (g.acres * rate).toFixed(1) + ' ' + state.rxUnit + '</td>' +
+                '</tr>';
+        });
+
+        printWin.document.write('<!DOCTYPE html><html><head><title>Prescription Report</title>' +
+            '<style>body{font-family:Inter,Segoe UI,sans-serif;max-width:800px;margin:40px auto;color:#1f2933}' +
+            'h1{font-size:24px;color:#1e8449}h2{font-size:16px;margin-top:32px;color:#27ae60}' +
+            'table{width:100%;border-collapse:collapse;margin-top:12px}th,td{padding:8px 12px;border-bottom:1px solid #e2e6ea;text-align:left}' +
+            'th{background:#f8f9fa;font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:0.5px}' +
+            '.totals{margin-top:20px;padding:16px;background:#f0fdf4;border-radius:12px}' +
+            '.totals p{margin:4px 0;font-size:14px}.totals strong{color:#1e8449}' +
+            '@media print{body{margin:20px}}</style></head><body>' +
+            '<h1>Agroptics Prescription Report</h1>' +
+            '<p><strong>Type:</strong> ' + state.rxType.charAt(0).toUpperCase() + state.rxType.slice(1) + '</p>' +
+            '<p><strong>Unit:</strong> ' + state.rxUnit + '</p>' +
+            '<p><strong>Method:</strong> ' + methodLabel($('zoneMethod').value) + '</p>' +
+            '<p><strong>Zones:</strong> ' + zoneCount() + '</p>' +
+            '<h2>Zone Summary</h2>' +
+            '<table><thead><tr><th>Zone</th><th style="text-align:right">Area</th><th style="text-align:right">Rate</th><th style="text-align:right">Total Product</th></tr></thead>' +
+            '<tbody>' + zonesHtml + '</tbody></table>' +
+            '<div class="totals">' +
+            '<p>Total Area: <strong>' + fmtAcres(totalArea) + ' ac</strong></p>' +
+            '<p>Total Product: <strong>' + totalProduct.toFixed(1) + ' ' + state.rxUnit + '</strong></p>' +
+            '</div>' +
+            '<p style="margin-top:40px;font-size:11px;color:#6b7280">Generated by Agroptics Prescription Demo</p>' +
+            '</body></html>');
+        printWin.document.close();
+        setTimeout(function () { printWin.print(); }, 500);
+    }
+
+    /* ═══════════ EXPORT — Classified Image ══════════════════════ */
+    function exportClassifiedImage() {
+        if (!state.classifiedGrid || !state.ndvi) return;
+        var n = state.currentBreaks ? state.currentBreaks.length + 1 : 3;
+        var canvas = document.createElement('canvas');
+        canvas.width = state.width;
+        canvas.height = state.height;
+        var ctx = canvas.getContext('2d');
+        var img = ctx.createImageData(state.width, state.height);
+        var colors = [];
+        for (var z = 1; z <= n; z++) colors[z] = zoneStyle(z, n);
+        for (var i = 0; i < state.classifiedGrid.length; i++) {
+            var o = i * 4;
+            var cls = state.classifiedGrid[i];
+            if (!cls || !colors[cls]) { img.data[o + 3] = 0; continue; }
+            img.data[o] = colors[cls].r;
+            img.data[o + 1] = colors[cls].g;
+            img.data[o + 2] = colors[cls].b;
+            img.data[o + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+        canvas.toBlob(function (blob) {
+            downloadBlob(blob, state.rxType + '_classified.png');
+        }, 'image/png');
+    }
+
+    function downloadBlob(blob, filename) {
         var a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = 'ndvi_vigor_zones.geojson';
+        a.download = filename;
         a.click();
         setTimeout(function () { URL.revokeObjectURL(a.href); }, 1500);
     }
 
-    async function loadBuffer(buffer, name) {
-        setMessage('Loading index');
-        try {
-            await parseGeoTIFF(buffer, name);
-        } catch (err) {
-            console.error(err);
-            setMessage(err.message || 'Could not read GeoTIFF');
+    /* ═══════════ PRESCRIPTION TYPE ══════════════════════════════ */
+    function setRxType(type) {
+        state.rxType = type;
+        /* Update tabs */
+        var tabs = document.querySelectorAll('.rx-tab');
+        for (var i = 0; i < tabs.length; i++) {
+            tabs[i].classList.toggle('is-active', tabs[i].dataset.rx === type);
+        }
+        /* Update units */
+        var units = RX_UNITS[type] || [];
+        var sel = $('unitSelect');
+        sel.innerHTML = '';
+        units.forEach(function (u) {
+            var opt = document.createElement('option');
+            opt.value = u.value;
+            opt.textContent = u.label;
+            sel.appendChild(opt);
+        });
+        state.rxUnit = units[0] ? units[0].value : '';
+
+        /* Show/hide index group */
+        var indexGroup = $('indexGroup');
+        if (type === 'irrigation') {
+            indexGroup.style.display = 'none';
+        } else {
+            indexGroup.style.display = '';
+        }
+
+        /* Reset rates to defaults for this type */
+        state.zoneRates = {};
+        if (state.features.length) {
+            updateRatesUI(state.features);
+            updateTotals(state.features);
         }
     }
 
+    /* ═══════════ BREAK EDITOR ═══════════════════════════════════ */
+    function updateBreakEditor() {
+        var method = $('zoneMethod').value;
+        var group = $('tableBreaksGroup');
+        if (method !== 'table') {
+            group.style.display = 'none';
+            return;
+        }
+        group.style.display = '';
+        var n = zoneCount();
+        var editor = $('breakEditor');
+        editor.innerHTML = '';
+        var defaults = tableBreaks(n);
+        for (var i = 0; i < n - 1; i++) {
+            var row = document.createElement('div');
+            row.className = 'break-row';
+            row.innerHTML = '<span>Break ' + (i + 1) + ':</span>' +
+                '<input type="number" min="0" max="1" step="0.01" value="' + (defaults[i] != null ? defaults[i] : (i + 1) / n) + '" />';
+            editor.appendChild(row);
+            row.querySelector('input').addEventListener('change', function () {
+                scheduleZones();
+            });
+        }
+    }
+
+    /* ═══════════ CUSTOM PICKER ══════════════════════════════════ */
     function closePickers() {
         var open = document.querySelectorAll('.picker.is-open');
         for (var i = 0; i < open.length; i++) {
@@ -865,7 +1175,6 @@
                 item.type = 'button';
                 item.className = 'picker-item';
                 item.dataset.value = opt.value;
-                item.textContent = '';
                 var value = document.createElement('span');
                 value.textContent = opt.textContent;
                 item.appendChild(value);
@@ -892,6 +1201,7 @@
             e.stopPropagation();
             var willOpen = menu.hidden;
             closePickers();
+            closeExportMenu();
             if (willOpen) {
                 menu.hidden = false;
                 picker.classList.add('is-open');
@@ -906,32 +1216,34 @@
         paint();
     }
 
-    function bindUi() {
-        enhanceSelect($('zoneCount'));
-        enhanceSelect($('zoneMethod'));
-        enhanceSelect($('zoneAgg'));
-        enhanceSelect($('minAcres'));
-        document.addEventListener('click', closePickers);
-        $('tifInput').addEventListener('change', function (e) {
-            var file = e.target.files && e.target.files[0];
-            if (!file) return;
-            file.arrayBuffer().then(function (buf) { loadBuffer(buf, file.name); });
-        });
-        $('minAcres').addEventListener('change', scheduleZones);
-        $('zoneCount').addEventListener('change', scheduleZones);
-        $('zoneMethod').addEventListener('change', scheduleZones);
-        $('zoneAgg').addEventListener('change', scheduleZones);
-        $('layerImage').addEventListener('change', applyLayers);
-        $('layerPolygons').addEventListener('change', applyLayers);
-        $('exportGeojsonBtn').addEventListener('click', exportGeoJSON);
-        updateFieldNotes();
+    /* ═══════════ EXPORT MENU ════════════════════════════════════ */
+    function closeExportMenu() {
+        var menu = $('exportMenu');
+        if (menu) menu.hidden = true;
     }
 
+    /* ═══════════ LOAD ═══════════════════════════════════════════ */
+    async function loadBuffer(buffer, name) {
+        setMessage('Loading index');
+        try {
+            await parseGeoTIFF(buffer, name);
+        } catch (err) {
+            console.error(err);
+            setMessage(err.message || 'Could not read GeoTIFF');
+        }
+    }
+
+    /* ═══════════ FIELD NOTES ════════════════════════════════════ */
     function updateFieldNotes() {
         $('zoneNote').textContent = optionHint($('zoneCount'));
         $('methodNote').textContent = optionHint($('zoneMethod'));
         $('aggNote').textContent = optionHint($('zoneAgg'));
         $('acreNote').textContent = optionHint($('minAcres'));
+        var indexSel = $('indexSelect');
+        var indexNote = $('indexNote');
+        if (indexSel && indexNote) {
+            indexNote.textContent = optionHint(indexSel);
+        }
     }
 
     function optionHint(select) {
@@ -942,9 +1254,89 @@
     function scheduleZones() {
         clearTimeout(state.regenTimer);
         updateFieldNotes();
+        updateBreakEditor();
         generateZones();
     }
 
+    /* ═══════════ BIND UI ════════════════════════════════════════ */
+    function bindUi() {
+        enhanceSelect($('zoneCount'));
+        enhanceSelect($('zoneMethod'));
+        enhanceSelect($('zoneAgg'));
+        enhanceSelect($('minAcres'));
+        enhanceSelect($('indexSelect'));
+        document.addEventListener('click', function () { closePickers(); closeExportMenu(); });
+
+        /* File input */
+        $('tifInput').addEventListener('change', function (e) {
+            var file = e.target.files && e.target.files[0];
+            if (!file) return;
+            file.arrayBuffer().then(function (buf) { loadBuffer(buf, file.name); });
+        });
+
+        /* Controls */
+        $('minAcres').addEventListener('change', scheduleZones);
+        $('zoneCount').addEventListener('change', function () {
+            state.zoneRates = {};
+            scheduleZones();
+        });
+        $('zoneMethod').addEventListener('change', scheduleZones);
+        $('zoneAgg').addEventListener('change', scheduleZones);
+        $('smoothToggle').addEventListener('change', scheduleZones);
+        $('layerImage').addEventListener('change', applyLayers);
+        $('layerPolygons').addEventListener('change', applyLayers);
+        $('indexSelect').addEventListener('change', function () {
+            updateFieldNotes();
+        });
+
+        /* Prescription tabs */
+        var tabs = document.querySelectorAll('.rx-tab');
+        for (var t = 0; t < tabs.length; t++) {
+            tabs[t].addEventListener('click', function () {
+                setRxType(this.dataset.rx);
+            });
+        }
+
+        /* Unit select */
+        $('unitSelect').addEventListener('change', function () {
+            state.rxUnit = this.value;
+            if (state.features.length) {
+                updateRatesUI(state.features);
+                updateTotals(state.features);
+            }
+        });
+
+        /* Export button */
+        $('exportBtn').addEventListener('click', function (e) {
+            e.stopPropagation();
+            var menu = $('exportMenu');
+            var willOpen = menu.hidden;
+            closePickers();
+            closeExportMenu();
+            if (willOpen) menu.hidden = false;
+        });
+
+        /* Export items */
+        var exportItems = document.querySelectorAll('.export-item');
+        for (var ei = 0; ei < exportItems.length; ei++) {
+            exportItems[ei].addEventListener('click', function (e) {
+                e.stopPropagation();
+                closeExportMenu();
+                var format = this.dataset.format;
+                if (format === 'geojson') exportGeoJSON();
+                else if (format === 'shapefile') exportShapefile();
+                else if (format === 'pdf') exportPDF();
+                else if (format === 'image') exportClassifiedImage();
+            });
+        }
+
+        /* Initial state */
+        setRxType('irrigation');
+        updateFieldNotes();
+        updateBreakEditor();
+    }
+
+    /* ═══════════ INIT ═══════════════════════════════════════════ */
     document.addEventListener('DOMContentLoaded', function () {
         initMap();
         bindUi();
