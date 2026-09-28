@@ -702,8 +702,7 @@
         }).addTo(state.map);
         $('exportBtn').disabled = features.length === 0;
         applyLayers();
-        updateChart(features);
-        updateRatesUI(features);
+        updateZoneCombinedList(features);
         updateTotals(features);
     }
 
@@ -719,60 +718,37 @@
         else if (state.map.hasLayer(layer)) { state.map.removeLayer(layer); }
     }
 
-    /* ═══════════ LEGEND ═════════════════════════════════════════ */
+    /* ═══════════ LEGEND (in-panel colour bar) ══════════════════ */
     function updateLegend(breaks) {
         var n = breaks.length + 1;
         var bar = $('legendBar');
         var ticks = $('legendTicks');
-        var rows = $('legendRows');
+        if (!bar || !ticks) return;
         bar.style.gridTemplateColumns = 'repeat(' + n + ', 1fr)';
         bar.innerHTML = '';
-        rows.innerHTML = '';
         for (var z = 1; z <= n; z++) {
             var color = zoneStyle(z, n);
             var name = zoneName(z, n);
-            var range = classRange(z, breaks, classBounds($('zoneMethod').value));
             var seg = document.createElement('div');
             seg.className = 'legend-seg';
             seg.style.background = color.hex;
             seg.style.color = (color.r + color.g + color.b) > 520 ? '#3f3f3f' : '#fff';
             seg.textContent = name;
             bar.appendChild(seg);
-            var row = document.createElement('div');
-            row.className = 'legend-row';
-            row.innerHTML = '<span class="swatch" style="background:' + color.hex + '"></span>' +
-                '<span>' + name + '</span>' +
-                '<span class="legend-range">' + fmt(range.min) + ' – ' + fmt(range.max) + '</span>';
-            rows.appendChild(row);
         }
         var bounds = classBounds($('zoneMethod').value);
         var marks = [bounds.min].concat(breaks).concat([bounds.max]);
         ticks.innerHTML = marks.map(function (v) { return '<span>' + fmt(v) + '</span>'; }).join('');
-        $('legendTitle').textContent = methodLabel($('zoneMethod').value);
     }
 
-    /* ═══════════ CHART ══════════════════════════════════════════ */
-    function updateChart(features) {
+    /* ═══════════ DONUT CHART ════════════════════════════════════ */
+    function buildDonut(slices, total) {
         var host = $('zoneChart');
-        var list = $('chartList');
         host.innerHTML = '';
-        list.innerHTML = '';
-        var groups = {};
-        features.forEach(function (f) {
-            var z = f.properties.zone;
-            if (!groups[z]) {
-                groups[z] = { zone: z, label: f.properties.label, color: f.properties.color, acres: 0, value: f.properties.ndvi_value };
-            }
-            groups[z].acres += Number(f.properties.area_acres) || 0;
-        });
-        var slices = Object.keys(groups).map(function (k) { return groups[k]; });
-        slices.sort(function (a, b) { return a.zone - b.zone; });
-        var total = slices.reduce(function (sum, s) { return sum + s.acres; }, 0);
         if (!slices.length || !(total > 0)) {
             host.innerHTML = '<div class="chart-empty">No areas</div>';
             return;
         }
-
         var svgNS = 'http://www.w3.org/2000/svg';
         var size = 200, cx = 100, cy = 100, radius = 58;
         var circ = 2 * Math.PI * radius;
@@ -782,89 +758,102 @@
         slices.forEach(function (slice, index) {
             var len = index === slices.length - 1 ? Math.max(0, circ - drawn) : (slice.acres / total) * circ;
             var ring = document.createElementNS(svgNS, 'circle');
-            ring.setAttribute('cx', cx);
-            ring.setAttribute('cy', cy);
-            ring.setAttribute('r', radius);
-            ring.setAttribute('fill', 'none');
-            ring.setAttribute('stroke', slice.color);
+            ring.setAttribute('cx', cx); ring.setAttribute('cy', cy); ring.setAttribute('r', radius);
+            ring.setAttribute('fill', 'none'); ring.setAttribute('stroke', slice.color);
             ring.setAttribute('stroke-width', '24');
             ring.setAttribute('stroke-dasharray', len + ' ' + Math.max(0, circ - len));
             ring.setAttribute('stroke-dashoffset', String(-drawn));
             ring.setAttribute('transform', 'rotate(-90 ' + cx + ' ' + cy + ')');
             svg.appendChild(ring);
-
             var mid = -Math.PI / 2 + ((drawn + len / 2) / circ) * Math.PI * 2;
-            var lx = cx + Math.cos(mid) * 86;
-            var ly = cy + Math.sin(mid) * 86;
+            var lx = cx + Math.cos(mid) * 86, ly = cy + Math.sin(mid) * 86;
             if (len / circ >= 0.06) {
-                var label = document.createElementNS(svgNS, 'text');
-                label.setAttribute('x', lx);
-                label.setAttribute('y', ly);
-                label.setAttribute('text-anchor', lx > cx + 8 ? 'start' : (lx < cx - 8 ? 'end' : 'middle'));
-                label.setAttribute('dominant-baseline', 'middle');
-                label.setAttribute('fill', '#e4e8ee');
-                label.setAttribute('font-size', '11');
-                label.setAttribute('font-weight', '700');
-                label.setAttribute('font-family', 'Inter, sans-serif');
-                label.textContent = fmtAcres(slice.acres);
-                svg.appendChild(label);
+                var lbl = document.createElementNS(svgNS, 'text');
+                lbl.setAttribute('x', lx); lbl.setAttribute('y', ly);
+                lbl.setAttribute('text-anchor', lx > cx + 8 ? 'start' : (lx < cx - 8 ? 'end' : 'middle'));
+                lbl.setAttribute('dominant-baseline', 'middle');
+                lbl.setAttribute('fill', '#1f2933'); lbl.setAttribute('font-size', '11');
+                lbl.setAttribute('font-weight', '700'); lbl.setAttribute('font-family', 'Inter, sans-serif');
+                lbl.textContent = fmtAcres(slice.acres);
+                svg.appendChild(lbl);
             }
             drawn += len;
         });
         host.appendChild(svg);
-
         var center = document.createElement('div');
         center.className = 'donut-center';
         center.innerHTML = '<strong>' + fmtAcres(total) + '</strong><span>ac</span>';
         host.appendChild(center);
-
-        slices.forEach(function (slice) {
-            var row = document.createElement('div');
-            row.className = 'chart-row';
-            row.innerHTML = '<span class="chart-dot" style="background:' + slice.color + '"></span>' +
-                '<span>' + slice.zone + ' ' + slice.label +
-                (slice.value == null ? '' : '<span class="chart-agg">' + ($('zoneAgg').value === 'median' ? 'Median' : 'Average') + ' ' + fmt(slice.value) + '</span>') +
-                '</span>' +
-                '<span class="chart-acres">' + fmtAcres(slice.acres) + ' ac</span>';
-            list.appendChild(row);
-        });
     }
 
-    /* ═══════════ RATES UI ═══════════════════════════════════════ */
-    function updateRatesUI(features) {
-        var list = $('ratesList');
-        list.innerHTML = '';
+    /* ═══════════ COMBINED ZONE LIST (chart + legend info + rates) */
+    function updateZoneCombinedList(features) {
+        /* Build per-zone aggregates */
         var groups = {};
         features.forEach(function (f) {
             var z = f.properties.zone;
-            if (!groups[z]) groups[z] = { zone: z, label: f.properties.label, color: f.properties.color };
-        });
-        var zones = Object.keys(groups).map(function (k) { return groups[k]; });
-        zones.sort(function (a, b) { return a.zone - b.zone; });
-        var defaults = RX_DEFAULT_RATES[state.rxType] || [0, 0, 0, 0, 0];
-
-        zones.forEach(function (z) {
-            if (state.zoneRates[z.zone] == null) {
-                state.zoneRates[z.zone] = defaults[z.zone] || 0;
+            if (!groups[z]) {
+                groups[z] = {
+                    zone: z, label: f.properties.label, color: f.properties.color,
+                    acres: 0, value: f.properties.ndvi_value,
+                    ndvi_min: f.properties.ndvi_min, ndvi_max: f.properties.ndvi_max
+                };
             }
-            var row = document.createElement('div');
-            row.className = 'rate-row';
-            row.innerHTML =
-                '<span class="rate-dot" style="background:' + z.color + '"></span>' +
-                '<span class="rate-label">' + z.label + '</span>' +
-                '<div class="rate-input-wrap">' +
-                    '<input type="number" min="0" step="any" value="' + (state.zoneRates[z.zone] || '') + '" data-zone="' + z.zone + '" />' +
-                    '<span class="rate-unit">' + state.rxUnit + '</span>' +
+            groups[z].acres += Number(f.properties.area_acres) || 0;
+        });
+        var slices = Object.keys(groups).map(function (k) { return groups[k]; });
+        slices.sort(function (a, b) { return a.zone - b.zone; });
+        var total = slices.reduce(function (s, sl) { return s + sl.acres; }, 0);
+
+        /* Donut */
+        buildDonut(slices, total);
+
+        /* Zone cards */
+        var container = $('zoneCombinedList');
+        if (!container) return;
+        container.innerHTML = '';
+        var defaults = RX_DEFAULT_RATES[state.rxType] || [0, 0, 0, 0, 0];
+        var aggLabel = $('zoneAgg').value === 'median' ? 'Median' : 'Average';
+
+        slices.forEach(function (sl) {
+            if (state.zoneRates[sl.zone] == null) {
+                state.zoneRates[sl.zone] = defaults[sl.zone] || 0;
+            }
+            var card = document.createElement('div');
+            card.className = 'zone-combined-row';
+
+            var metaHtml = sl.value != null
+                ? aggLabel + ' index: ' + fmt(sl.value)
+                : '';
+            var rangeHtml = 'Range: ' + fmt(sl.ndvi_min) + ' – ' + fmt(sl.ndvi_max);
+
+            card.innerHTML =
+                '<div class="zcr-header">' +
+                    '<span class="zcr-dot" style="background:' + sl.color + '"></span>' +
+                    '<span class="zcr-name">' + sl.zone + '. ' + sl.label + '</span>' +
+                    '<span class="zcr-area">' + fmtAcres(sl.acres) + ' ac</span>' +
+                '</div>' +
+                (metaHtml ? '<div class="zcr-meta">' + metaHtml + '</div>' : '') +
+                '<div class="zcr-range">' + rangeHtml + '</div>' +
+                '<div class="zcr-rate-row">' +
+                    '<span class="zcr-rate-label">Rate:</span>' +
+                    '<input class="zcr-rate-input" type="number" min="0" step="any" value="' +
+                        (state.zoneRates[sl.zone] != null ? state.zoneRates[sl.zone] : '') + '" />' +
+                    '<span class="zcr-rate-unit">' + state.rxUnit + '</span>' +
                 '</div>';
-            list.appendChild(row);
-            row.querySelector('input').addEventListener('input', function (e) {
-                state.zoneRates[z.zone] = parseFloat(e.target.value) || 0;
-                /* Update feature properties */
-                state.features.forEach(function (f) {
-                    if (f.properties.zone === z.zone) f.properties.rate = state.zoneRates[z.zone];
+
+            container.appendChild(card);
+
+            /* Rate change handler — closure over sl.zone */
+            (function (zoneId) {
+                card.querySelector('.zcr-rate-input').addEventListener('input', function (e) {
+                    state.zoneRates[zoneId] = parseFloat(e.target.value) || 0;
+                    state.features.forEach(function (f) {
+                        if (f.properties.zone === zoneId) f.properties.rate = state.zoneRates[zoneId];
+                    });
+                    updateTotals(state.features);
                 });
-                updateTotals(state.features);
-            });
+            })(sl.zone);
         });
     }
 
@@ -1085,32 +1074,86 @@
         for (var i = 0; i < tabs.length; i++) {
             tabs[i].classList.toggle('is-active', tabs[i].dataset.rx === type);
         }
-        /* Update units */
+        /* Update unit picker */
         var units = RX_UNITS[type] || [];
+        /* Keep the hidden select in sync */
         var sel = $('unitSelect');
         sel.innerHTML = '';
         units.forEach(function (u) {
             var opt = document.createElement('option');
-            opt.value = u.value;
-            opt.textContent = u.label;
+            opt.value = u.value; opt.textContent = u.label;
             sel.appendChild(opt);
         });
         state.rxUnit = units[0] ? units[0].value : '';
+        /* Rebuild the visual unit-picker menu */
+        rebuildUnitPicker(units, state.rxUnit);
 
         /* Show/hide index group */
-        var indexGroup = $('indexGroup');
-        if (type === 'irrigation') {
-            indexGroup.style.display = 'none';
-        } else {
-            indexGroup.style.display = '';
-        }
+        $('indexGroup').style.display = (type === 'irrigation') ? 'none' : '';
 
         /* Reset rates to defaults for this type */
         state.zoneRates = {};
         if (state.features.length) {
-            updateRatesUI(state.features);
+            updateZoneCombinedList(state.features);
             updateTotals(state.features);
         }
+    }
+
+    /* ═══════════ UNIT PICKER ════════════════════════════════════ */
+    function rebuildUnitPicker(units, selected) {
+        var btn = $('unitPickerBtn');
+        var menu = $('unitPickerMenu');
+        if (!btn || !menu) return;
+        menu.innerHTML = '';
+        units.forEach(function (u) {
+            var item = document.createElement('button');
+            item.type = 'button';
+            item.className = 'unit-picker-item' + (u.value === selected ? ' is-selected' : '');
+            item.textContent = u.label;
+            item.addEventListener('click', function (e) {
+                e.stopPropagation();
+                state.rxUnit = u.value;
+                $('unitSelect').value = u.value;
+                btn.textContent = u.label;
+                /* Mark selected */
+                menu.querySelectorAll('.unit-picker-item').forEach(function (el) {
+                    el.classList.toggle('is-selected', el === item);
+                });
+                menu.hidden = true;
+                $('unitPicker').classList.remove('is-open');
+                if (state.features.length) {
+                    updateZoneCombinedList(state.features);
+                    updateTotals(state.features);
+                }
+            });
+            menu.appendChild(item);
+        });
+        btn.textContent = (units[0] ? units[0].label : '');
+    }
+
+    function bindUnitPicker() {
+        var picker = $('unitPicker');
+        var btn = $('unitPickerBtn');
+        var menu = $('unitPickerMenu');
+        if (!picker || !btn || !menu) return;
+        btn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            var willOpen = menu.hidden;
+            closeUnitPicker();
+            closePickers();
+            closeExportMenu();
+            if (willOpen) {
+                menu.hidden = false;
+                picker.classList.add('is-open');
+            }
+        });
+    }
+
+    function closeUnitPicker() {
+        var picker = $('unitPicker');
+        var menu = $('unitPickerMenu');
+        if (picker) picker.classList.remove('is-open');
+        if (menu) menu.hidden = true;
     }
 
     /* ═══════════ BREAK EDITOR ═══════════════════════════════════ */
@@ -1222,6 +1265,22 @@
         if (menu) menu.hidden = true;
     }
 
+    function positionAndOpenExportMenu() {
+        var btn = $('exportBtn');
+        var menu = $('exportMenu');
+        if (!btn || !menu) return;
+        var rect = btn.getBoundingClientRect();
+        /* Open upward so it's never clipped inside the panel */
+        menu.hidden = false;
+        var menuH = menu.offsetHeight || 180; /* approximate if not yet painted */
+        menu.style.left = rect.left + 'px';
+        menu.style.top = (rect.top - menuH - 6) + 'px';
+        /* Ensure it doesn't go off the top of the viewport */
+        if (parseFloat(menu.style.top) < 8) {
+            menu.style.top = (rect.bottom + 6) + 'px'; /* fall back: open downward */
+        }
+    }
+
     /* ═══════════ LOAD ═══════════════════════════════════════════ */
     async function loadBuffer(buffer, name) {
         setMessage('Loading index');
@@ -1265,7 +1324,10 @@
         enhanceSelect($('zoneAgg'));
         enhanceSelect($('minAcres'));
         enhanceSelect($('indexSelect'));
-        document.addEventListener('click', function () { closePickers(); closeExportMenu(); });
+        bindUnitPicker();
+        document.addEventListener('click', function () {
+            closePickers(); closeExportMenu(); closeUnitPicker();
+        });
 
         /* File input */
         $('tifInput').addEventListener('change', function (e) {
@@ -1285,35 +1347,21 @@
         $('smoothToggle').addEventListener('change', scheduleZones);
         $('layerImage').addEventListener('change', applyLayers);
         $('layerPolygons').addEventListener('change', applyLayers);
-        $('indexSelect').addEventListener('change', function () {
-            updateFieldNotes();
-        });
+        $('indexSelect').addEventListener('change', updateFieldNotes);
 
         /* Prescription tabs */
         var tabs = document.querySelectorAll('.rx-tab');
         for (var t = 0; t < tabs.length; t++) {
-            tabs[t].addEventListener('click', function () {
-                setRxType(this.dataset.rx);
-            });
+            tabs[t].addEventListener('click', function () { setRxType(this.dataset.rx); });
         }
 
-        /* Unit select */
-        $('unitSelect').addEventListener('change', function () {
-            state.rxUnit = this.value;
-            if (state.features.length) {
-                updateRatesUI(state.features);
-                updateTotals(state.features);
-            }
-        });
-
-        /* Export button */
+        /* Export button — position menu via fixed coords so it's never clipped */
         $('exportBtn').addEventListener('click', function (e) {
             e.stopPropagation();
             var menu = $('exportMenu');
             var willOpen = menu.hidden;
-            closePickers();
-            closeExportMenu();
-            if (willOpen) menu.hidden = false;
+            closePickers(); closeUnitPicker(); closeExportMenu();
+            if (willOpen) positionAndOpenExportMenu();
         });
 
         /* Export items */
