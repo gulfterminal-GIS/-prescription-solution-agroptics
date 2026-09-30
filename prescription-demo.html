@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agroptics — Prescription Map</title>
+    <meta name="description" content="Create variable-rate prescription maps for agricultural machines from satellite imagery." />
+    <link rel="stylesheet" href="js/lib/leaflet.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="prescription-demo.css?v=35" />
+</head>
+<body>
+
+    <!-- ═══════════ TOP BAR — Prescription Type ═══════════ -->
+    <header class="top-bar">
+        <div class="top-brand">
+            <svg class="brand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"/><path d="M8 12l2 2 4-4"/></svg>
+            <span>Agroptics</span>
+        </div>
+        <nav class="rx-tabs" id="rxTabs">
+            <button class="rx-tab is-active" data-rx="irrigation">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2.69l5.66 5.66a8 8 0 11-11.31 0z"/></svg>
+                Irrigation
+            </button>
+            <button class="rx-tab" data-rx="seeding">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+                Seeding
+            </button>
+            <button class="rx-tab" data-rx="fertilizer">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 21l3-9M14 21l3-9M4 12h16M5 6l7-4 7 4"/></svg>
+                Fertilizer
+            </button>
+            <button class="rx-tab" data-rx="herbicide">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22V8M5 12l7-10 7 10M9 18c0-1.5 1.5-3 3-3s3 1.5 3 3"/></svg>
+                Herbicide
+            </button>
+        </nav>
+        <div class="rx-unit-badge" id="rxUnitBadge">
+            <span class="unit-label">Unit:</span>
+            <div class="unit-picker" id="unitPicker">
+                <button type="button" class="unit-picker-btn" id="unitPickerBtn">inch</button>
+                <div class="unit-picker-menu" id="unitPickerMenu" hidden></div>
+            </div>
+            <select id="unitSelect" title="Rate unit" aria-hidden="true">
+                <option value="inch">inch</option>
+                <option value="mm">mm</option>
+            </select>
+        </div>
+    </header>
+
+    <!-- ═══════════ LEFT PANEL — Controls ═══════════ -->
+    <aside class="side-panel">
+        <div class="panel-brand">Prescription Areas</div>
+
+        <!-- Index selector (hidden for irrigation) -->
+        <div class="panel-group" id="indexGroup" style="display:none">
+            <div class="panel-field panel-field-stack">
+                <span>Index</span>
+                <select id="indexSelect" title="Vegetation index">
+                    <option value="NDVI" selected data-hint="Normalized Difference Vegetation Index. Most common greenness measure.">NDVI</option>
+                    <option value="FC" data-hint="Fractional Cover. Fraction of ground covered by vegetation.">FC</option>
+                    <option value="MSAVI" data-hint="Modified Soil Adjusted Vegetation Index. Better for sparse canopy.">MSAVI</option>
+                    <option value="GCI" data-hint="Green Chlorophyll Index. Sensitive to chlorophyll content.">GCI</option>
+                    <option value="RECI" data-hint="Red Edge Chlorophyll Index. Uses red-edge band for crop monitoring.">RECI</option>
+                </select>
+            </div>
+            <p class="field-note" id="indexNote"></p>
+        </div>
+
+        <div class="panel-group">
+            <div class="panel-field">
+                <span>Zones</span>
+                <select id="zoneCount" title="Number of zones">
+                    <option value="2" data-hint="Two management areas. Each area can take its own rate.">2</option>
+                    <option value="3" selected data-hint="Three management areas.">3</option>
+                    <option value="4" data-hint="Four management areas. A finer split.">4</option>
+                    <option value="5" data-hint="Five management areas. The most detail.">5</option>
+                </select>
+            </div>
+            <p class="field-note" id="zoneNote"></p>
+        </div>
+
+        <div class="panel-group">
+            <div class="panel-field panel-field-stack">
+                <span>Method</span>
+                <select id="zoneMethod" title="How the index is split into zones">
+                    <option value="natural" selected data-hint="Natural Breaks. Finds the biggest jumps in this image and splits there.">Natural Breaks</option>
+                    <option value="quantile" data-hint="Quantile. Each zone gets about the same number of pixels.">Quantile</option>
+                    <option value="equal" data-hint="Equal interval. Splits this image's min-to-max into equal steps.">Equal interval</option>
+                    <option value="table" data-hint="Reclassify by table. Uses custom break values you can edit below.">Reclassify by table</option>
+                </select>
+            </div>
+            <p class="field-note" id="methodNote"></p>
+        </div>
+
+        <!-- Editable table breaks (visible only when method=table) -->
+        <div class="panel-group" id="tableBreaksGroup" style="display:none">
+            <div class="panel-field panel-field-stack">
+                <span>Break values</span>
+                <div class="break-editor" id="breakEditor">
+                    <!-- Populated dynamically -->
+                </div>
+            </div>
+            <p class="field-note">Edit the break values to define custom zone boundaries.</p>
+        </div>
+
+        <div class="panel-group">
+            <div class="panel-field panel-field-stack">
+                <span>Aggregation method</span>
+                <select id="zoneAgg" title="Value reported for each zone">
+                    <option value="average" selected data-hint="Data average. The zone value is the average index of its pixels.">Data average</option>
+                    <option value="median" data-hint="Data median. The zone value is the middle index of its pixels.">Data median</option>
+                </select>
+            </div>
+            <p class="field-note" id="aggNote"></p>
+        </div>
+
+        <div class="panel-group">
+            <div class="panel-field">
+                <span>Min. polygon (ac)</span>
+                <select id="minAcres" title="Minimum polygon size">
+                    <option value="0" selected data-hint="Keeps every patch. Small areas are not merged.">0</option>
+                    <option value="0.5" data-hint="Patches under 0.5 ac merge into the neighboring zone.">0.5</option>
+                    <option value="1" data-hint="Patches under 1 ac merge into the neighboring zone.">1</option>
+                    <option value="2" data-hint="Patches under 2 ac merge into the neighboring zone.">2</option>
+                    <option value="5" data-hint="Patches under 5 ac merge into the neighboring zone.">5</option>
+                    <option value="10" data-hint="Patches under 10 ac merge into the neighboring zone.">10</option>
+                </select>
+            </div>
+            <p class="field-note" id="acreNote"></p>
+        </div>
+
+        <div class="panel-group">
+            <div class="smooth-head">
+                <span>Smooth edges</span>
+                <span class="smooth-value" id="smoothValue">2</span>
+            </div>
+            <input type="range" id="smoothLevel" min="0" max="20" step="1" value="2" title="Smoothing strength" />
+            <p class="field-note" id="smoothNote">2 of 20. Higher joins the small steps into one curve.</p>
+        </div>
+
+        <div class="panel-layers">
+            <div class="panel-title">Layers</div>
+            <label class="layer-check">
+                <input type="checkbox" id="layerImage" checked />
+                <span class="check-box"></span>
+                <span>Classified image</span>
+            </label>
+            <label class="layer-check">
+                <input type="checkbox" id="layerPolygons" checked />
+                <span class="check-box"></span>
+                <span>Polygons</span>
+            </label>
+        </div>
+
+        <div class="panel-actions">
+            <div class="export-dropdown" id="exportDropdown">
+                <button type="button" class="export-btn" id="exportBtn" disabled>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
+                    Export
+                    <svg class="chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+                </button>
+                <div class="export-menu" id="exportMenu" hidden>
+                    <button class="export-item" data-format="shapefile">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                        Shapefile (.shp)
+                    </button>
+                    <button class="export-item" data-format="geojson">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/></svg>
+                        GeoJSON
+                    </button>
+                    <button class="export-item" data-format="pdf">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                        PDF Report
+                    </button>
+                    <button class="export-item" data-format="image">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                        Classified Image
+                    </button>
+                </div>
+            </div>
+            <label class="file-open">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+                Open
+                <input type="file" id="tifInput" accept=".tif,.tiff" />
+            </label>
+        </div>
+    </aside>
+
+    <!-- ═══════════ RIGHT PANEL — Summary + Rates ═══════════ -->
+    <aside class="summary-panel">
+        <div class="panel-title">Prescription Summary</div>
+
+        <!-- Donut chart -->
+        <div class="donut-wrap" id="zoneChart"></div>
+
+        <!-- Colour legend bar (method name + colour bar + ticks) -->
+        <div class="legend-in-panel" id="legendInPanel">
+            <div class="legend-bar" id="legendBar"></div>
+            <div class="legend-ticks" id="legendTicks"></div>
+        </div>
+
+        <!-- Combined zone cards: area, avg, index range, rate input -->
+        <div class="panel-title" style="margin-top:10px">Zones &amp; Rates</div>
+        <div class="zone-combined-list" id="zoneCombinedList">
+            <!-- Populated dynamically -->
+        </div>
+
+        <!-- Field totals -->
+        <div class="totals-section" id="totalsSection">
+            <div class="panel-title">Field Totals</div>
+            <div class="totals-grid" id="totalsGrid">
+                <!-- Populated dynamically -->
+            </div>
+        </div>
+    </aside>
+
+    <!-- ═══════════ MAP ═══════════ -->
+    <div id="map">
+        <div class="map-legend" id="legend">
+            <div class="legend-title" id="legendTitle">Natural Breaks</div>
+            <div class="legend-bar" id="legendBar"></div>
+            <div class="legend-ticks" id="legendTicks"></div>
+            <div class="legend-rows" id="legendRows"></div>
+        </div>
+        <div id="mapMessage" class="map-message">Loading index</div>
+    </div>
+
+    <script src="js/lib/leaflet.js"></script>
+    <script src="cdns/geotiff.js"></script>
+    <script src="cdns/proj4.js"></script>
+    <script src="cdns/turf.min.js"></script>
+    <script src="cdns/jszip.min.js"></script>
+    <script src="prescription-demo.js?v=44"></script>
+</body>
+</html>

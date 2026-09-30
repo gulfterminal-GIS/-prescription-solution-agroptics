@@ -547,27 +547,69 @@
     }
 
     /* ═══════════ SMOOTHING ══════════════════════════════════════ */
-    function smoothRing(ring, iterations) {
-        if (!iterations || ring.length < 4) return ring;
-        var result = ring;
-        for (var iter = 0; iter < iterations; iter++) {
-            var newRing = [result[0]];
-            for (var i = 0; i < result.length - 1; i++) {
-                var p0 = result[i];
-                var p1 = result[(i + 1) % (result.length - 1)] || result[i + 1];
-                newRing.push([
-                    0.75 * p0[0] + 0.25 * p1[0],
-                    0.75 * p0[1] + 0.25 * p1[1]
-                ]);
-                newRing.push([
-                    0.25 * p0[0] + 0.75 * p1[0],
-                    0.25 * p0[1] + 0.75 * p1[1]
-                ]);
+    /* Ease only the pixel steps. The zone outline stays on the classified area. */
+    function dist2d(a, b) {
+        var dx = a[0] - b[0];
+        var dy = a[1] - b[1];
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    function gaussianSmoothClosed(xy, radius) {
+        var n = xy.length;
+        if (n < 4 || radius <= 0) return xy;
+        var cum = [0];
+        for (var i = 1; i < n; i++) cum.push(cum[i - 1] + dist2d(xy[i], xy[i - 1]));
+        var total = cum[n - 1] + dist2d(xy[0], xy[n - 1]);
+        if (total < 1) return xy;
+        var reach = Math.min(radius, total * 0.15);
+        var sigma = reach / 2;
+        var sigma2 = 2 * sigma * sigma;
+        var out = [];
+        for (var i = 0; i < n; i++) {
+            var sx = 0;
+            var sy = 0;
+            var sw = 0;
+            for (var j = 0; j < n; j++) {
+                var d = Math.abs(cum[j] - cum[i]);
+                if (d > total / 2) d = total - d;
+                if (d > reach) continue;
+                var w = Math.exp(-(d * d) / sigma2);
+                sx += xy[j][0] * w;
+                sy += xy[j][1] * w;
+                sw += w;
             }
-            newRing.push(newRing[0].slice());
-            result = newRing;
+            out.push([sx / sw, sy / sw]);
         }
-        return result;
+        return out;
+    }
+
+    function smoothRing(ring, level) {
+        if (!level || ring.length < 4) return ring;
+        var open = ring.slice(0, ring.length - 1);
+        var n = open.length;
+        if (n < 4) return ring;
+        var lat0 = open[0][1] * Math.PI / 180;
+        var mLng = 111320 * Math.cos(lat0);
+        var mLat = 111320;
+        var origin = open[0];
+        var xy = [];
+        for (var i = 0; i < n; i++) {
+            xy.push([
+                (open[i][0] - origin[0]) * mLng,
+                (open[i][1] - origin[1]) * mLat
+            ]);
+        }
+        var radius = 8 + level * 1.4;
+        xy = gaussianSmoothClosed(xy, radius);
+        var out = [];
+        for (var k = 0; k < xy.length; k++) {
+            out.push([
+                origin[0] + xy[k][0] / mLng,
+                origin[1] + xy[k][1] / mLat
+            ]);
+        }
+        out.push(out[0].slice());
+        return out;
     }
 
     function smoothPolygonCoords(coords, iterations) {
@@ -611,7 +653,7 @@
     function polygonizeZones(grid, breaks, method, aggValues) {
         var features = [];
         var n = breaks.length + 1;
-        var doSmooth = $('smoothToggle') && $('smoothToggle').checked;
+        var smoothPasses = smoothIterations();
         for (var z = 1; z <= n; z++) {
             var pixelRings = collectRings(grid, z);
             if (!pixelRings.length) continue;
@@ -624,8 +666,7 @@
             var name = zoneName(z, n);
             var agg = aggValues[z];
             polys.forEach(function (coords) {
-                /* Apply smoothing if enabled */
-                var finalCoords = doSmooth ? smoothPolygonCoords(coords, 2) : coords;
+                var finalCoords = smoothPasses > 0 ? smoothPolygonCoords(coords, smoothPasses) : coords;
                 var geom = { type: 'Polygon', coordinates: finalCoords };
                 var areaM2 = 0;
                 try { areaM2 = turf.area(turf.feature(geom)); } catch (e) { areaM2 = 0; }
@@ -1716,6 +1757,26 @@
         if (indexSel && indexNote) {
             indexNote.textContent = optionHint(indexSel);
         }
+        updateSmoothNote();
+    }
+
+    function smoothIterations() {
+        var el = $('smoothLevel');
+        var n = el ? Number(el.value) : 0;
+        if (!isFinite(n) || n < 0) n = 0;
+        if (n > 20) n = 20;
+        return Math.round(n);
+    }
+
+    function updateSmoothNote() {
+        var n = smoothIterations();
+        var note = n === 0
+            ? 'Off. Edges follow every pixel corner.'
+            : n + ' of 20. Higher joins the small steps into one curve.';
+        var slider = $('smoothLevel');
+        if (slider) slider.style.setProperty('--ratio', String(n / 20));
+        if ($('smoothValue')) $('smoothValue').textContent = String(n);
+        if ($('smoothNote')) $('smoothNote').textContent = note;
     }
 
     function optionHint(select) {
@@ -1757,7 +1818,11 @@
         });
         $('zoneMethod').addEventListener('change', scheduleZones);
         $('zoneAgg').addEventListener('change', scheduleZones);
-        $('smoothToggle').addEventListener('change', scheduleZones);
+        $('smoothLevel').addEventListener('input', function () {
+            updateSmoothNote();
+            clearTimeout(state.regenTimer);
+            state.regenTimer = setTimeout(generateZones, 280);
+        });
         $('layerImage').addEventListener('change', applyLayers);
         $('layerPolygons').addEventListener('change', applyLayers);
         $('indexSelect').addEventListener('change', updateFieldNotes);
